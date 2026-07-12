@@ -1,0 +1,42 @@
+# --- Proprietary / PII data (NDA + PDPA — never commit) ---
+datasets/
+data/
+*.xlsx
+*.xls
+!Glossory_of_User_Trading_Data.xlsx   # reference doc, not raw trading/trader data — remove this line if unsure
+
+# Derived data (still sensitive — sanitized but not for public repo)
+features.csv
+traders_sanitized.csv
+*.csv
+!requirements.csv
+CONTEXT.md
+CLAUDE.md
+# Raw source zips
+*.zip
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+.Python
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# --- OS / editor cruft ---
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# --- Outputs that shouldn't be tracked ---
+*.log
+outputs/
