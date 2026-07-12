@@ -28,3 +28,40 @@ Solo entry, NTU veNTUre challenge. EDA memo due 24 Jul. See docs PDFs in repo ro
   (2,506 registrant-level repeaters)
 - Condition list in condition_masks() is pre-registered/frozen; new = exploratory
 - Cluster bootstrap by traderKey (fallback campaignId_accountId), never by trade
+
+## Stage 2 status (12 Jul 2026)
+- `features.py` implemented with streaming-safe `TraderState`; tests in
+  `tests/test_features.py` include the mechanical lookahead identity check
+- `build_features.py` builds `features_v2.csv` from trade loaders in
+  `pipeline.py`, joins trader metadata from `traders_sanitized.csv` only,
+  and caches prior-day XAUUSD OHLC in `cache/xauusd_daily_ohlc.csv`
+- `validate_features.py` writes `reports/stage2_validation.md`
+- `splits.py` now uses traderKey purging as the main disjointness rule, with
+  IP-cluster purging retained only for the 7 CHECK 7 synchronous pairs:
+  `(1,63)`, `(8,63)`, `(21,54)`, `(31,57)`, `(31,59)`, `(42,59)`, `(42,60)`
+
+## Retained feature set (21)
+- Removed under redundancy/deterministic pruning:
+  `dist_to_target`, `dist_to_dd_limit`, `streak_age_s`, `lot_ratio_vs_avg`,
+  `size_pctile`, `is_repeat`, `gap_compression`
+- Remaining moderate correlations above `|rho| > 0.70`:
+  `loss_streak` vs `dd_from_peak_pct` (`0.7383`),
+  `pnl_ewm` vs `pnl_pct` (`0.8537`),
+  `lot_zscore` vs `size_after_loss_delta` (`0.8612`)
+
+## Current validation snapshot
+- Primary-era sample: `6,582` positions, `496` active accounts
+- Walk-forward purged validation rows by fold: `371`, `454`, `464`, `901`
+  with row attrition `60.9%`, `56.1%`, `52.3%`, `43.3%`
+- Broad-rule purge decomposition: no traderKey-only overlaps; overlaps are
+  either IP-only or both traderKey and IP cluster
+- `gold_vol_prev_day` in `features_v2.csv` has `0.0%` NaN rate
+- `trades_per_hour > 60`: `176` positions across `142` distinct
+  `(campaignId, accountId)` pairs; treat as possible automation signal,
+  not a concluded rule violation
+
+## Drafting artifacts
+- `stage2_brief.tex` exists and includes Appendix A/B/C content sourced from
+  `FEATURES.md` and `reports/stage2_validation.md`
+- TeX source row-count check passed for Appendix B (`74` rows), but local
+  XeLaTeX compilation is still blocked because `xelatex` is not installed

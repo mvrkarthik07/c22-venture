@@ -9,3 +9,26 @@ Structural discoveries useful to C22 beyond the trading strategy itself:
 * Only about 6-8% of registered participants ever actually place a trade.
 * A meaningful share of active traders return across multiple campaigns and cluster on shared IP addresses — investigated in depth and found to be ordinary shared infrastructure (mobile/office networks), not coordinated multi-accounting, based on a synchrony test showing no unusual timing correlation across the vast majority of these clusters.
 Where it stands: All exploratory data analysis is complete and statistically stress-tested. Development has moved to Claude Code for hands-on execution against the codebase, with this conversation used for reviewing results, catching statistical issues, and deciding what matters for the write-up. Next steps: finalize a size-weighted vs. flat-size fading comparison, write the formal EDA memo (due before the 24 July checkpoint), then move to Stage 2 (turning these findings into engineered features) and Stage 3 (a combined predictive model), validated the same rigorous way the EDA already has been.
+
+Update — 12 Jul 2026:
+Stage 2 implementation is now in place. `features.py` defines a streaming-safe `TraderState` with strict compute-then-update causality, and `tests/test_features.py` includes the mechanical lookahead check (truncated vs full-sequence identity). The initial frozen 28-feature spec was implemented first, then pruned under the pre-committed redundancy rule to a retained 21-feature set. Removed features: `dist_to_target`, `dist_to_dd_limit`, `streak_age_s`, `lot_ratio_vs_avg`, `size_pctile`, `is_repeat`, `gap_compression`.
+
+Data build + validation pipeline:
+* `build_features.py` reuses `pipeline.py` trade loaders (`load_all_trades`, `to_positions`, `infer_exit_type`), reads only `traders_sanitized.csv` for trader metadata, downloads/caches prior-day XAUUSD OHLC into `cache/xauusd_daily_ohlc.csv`, and writes `features_v2.csv`.
+* `validate_features.py` generates `reports/stage2_validation.md` with the full primary-era univariate bucket table, the Spearman correlation matrix, and walk-forward fold attrition tables.
+* `splits.py` now implements expanding-window folds across campaigns `53–65`, with traderKey purging as the main disjointness rule and IP-cluster purging retained only for the 7 CHECK 7 synchronous `(ipClusterId, campaignId)` pairs: `(1,63)`, `(8,63)`, `(21,54)`, `(31,57)`, `(31,59)`, `(42,59)`, `(42,60)`.
+
+Current Stage 2 validation state:
+* Primary-era sample remains `6,582` positions across `496` active accounts.
+* After pruning, only 3 feature pairs remain above `|rho| > 0.70`: `loss_streak` vs `dd_from_peak_pct` (`0.7383`), `pnl_ewm` vs `pnl_pct` (`0.8537`), and `lot_zscore` vs `size_after_loss_delta` (`0.8612`).
+* Walk-forward purged validation sizes are `371`, `454`, `464`, and `901` rows by fold, with row attrition `60.9%`, `56.1%`, `52.3%`, and `43.3%`.
+* The broad-rule purge decomposition showed trader overlap is never traderKey-only in this sample; overlaps are either IP-only or both traderKey and IP cluster.
+* `gold_vol_prev_day` is fully populated in `features_v2.csv` (`0.0%` NaN rate), one prior-day realized-range value per campaign.
+
+Useful diagnostics produced during this pass:
+* Rows with `trades_per_hour > 60`: `176` positions across `142` distinct `(campaignId, accountId)` pairs.
+* Within that subset, `trade_index` is concentrated at `2` (`141` rows), then `3` (`25`), with only a handful at `4+`; implied hours since first open have mean `0.0269` hours (~`1.61` minutes), median `0.0233` hours (~`1.40` minutes), and max `0.1208` hours (~`7.25` minutes). This supports the write-up framing as a possible automation signature rather than ordinary late-session manual behavior.
+
+Deliverable drafting:
+* `stage2_brief.tex` was generated as a full XeLaTeX document combining the main Stage 2 body with Appendix A (feature definitions), Appendix B (full univariate validation table), and Appendix C (walk-forward fold composition).
+* The TeX source was checked for table-row consistency against `reports/stage2_validation.md` (Appendix B row count matches at `74`), but the local environment does not currently have a TeX toolchain (`xelatex` not installed), so compilation/page-count verification still needs to be run on a machine with XeLaTeX available.

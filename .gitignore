@@ -10,8 +10,7 @@ features.csv
 traders_sanitized.csv
 *.csv
 !requirements.csv
-CONTEXT.md
-CLAUDE.md
+
 # Raw source zips
 *.zip
 
