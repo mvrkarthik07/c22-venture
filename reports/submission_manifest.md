@@ -6,10 +6,10 @@ Raw campaign data and derived CSV exports are excluded by `.gitignore`.
 
 | File | Size (bytes) | C22 requirement |
 |---|---:|---|
-| `.gitignore` | 999 | Excludes raw datasets, PII, and derived exports |
-| `README.md` | 2110 | Submission entry point and reproduction instructions |
+| `.gitignore` | 1016 | Excludes raw datasets, PII, and derived exports |
+| `README.md` | 2103 | Submission entry point and reproduction instructions |
 | `requirements.txt` | 113 | Exact pinned environment |
-| `reproduce_all.py` | 5673 | One-command reproduction with supplied dataset path |
+| `reproduce_all.py` | 5805 | One-command reproduction with supplied dataset path |
 | `stage3_model.py` | 69105 | Frozen causal V2 model and `predict()` entry point |
 | `artifacts/stage3_v2.json` | 24960 | Required frozen coefficients and preprocessing |
 | `features.py` | 22851 | Streaming causal feature state |
@@ -25,20 +25,25 @@ Raw campaign data and derived CSV exports are excluded by `.gitignore`.
 | `CLAUDE.md` | 3907 | Project methodology and data-handling constraints |
 | `FEATURES.md` | 14682 | Feature definitions and admissibility contract |
 | `CONTEXT.md` | 7516 | Project context |
-| `stage3_brief.tex` | 2916 | Stage 3 brief source |
 | `stage3_report.pdf` | 124655 | Stage 3 brief PDF supplied for submission |
+| `reports/README.md` | 4074 | Reviewer-facing report tier index |
+| `reports/archive/README.md` | 387 | Archive explanation and superseded-file map |
 | `reports/stage3_backtest.md` | 20322 | Stage 3 backtest, economics, C66 audit, and power |
 | `reports/trials_log_and_power.md` | 37714 | Trials log, FDR correction, and power analysis |
 | `reports/common_split_viability.md` | 18568 | Mandated split viability |
 | `reports/sl_leak_audit_v2.md` | 14895 | Refreshed stop-loss leakage audit |
 | `reports/feature_checks_walkforward.md` | 75577 | Walk-forward feature checks |
 | `reports/repro_check.md` | 6433 | Reproduction verification |
-| `reports/design_annex_stats.md` | 5779 | Design statistics referenced by Stage 3 |
-| `reports/family_g_value.md` | 4434 | Family G validation report |
+| `reports/design_annex_stats.md` | 5563 | Design statistics referenced by Stage 3 |
+| `reports/family_g_value.md` | 4433 | Family G validation report |
 | `reports/stage2_validation.md` | 14325 | Stage 2 validation report |
+| `reports/archive/sl_leak_audit.md` | 5971 | Superseded stop-loss audit retained for audit trail |
+| `reports/archive/balance_inference.md` | 2226 | Superseded balance inference retained for audit trail |
+| `reports/archive/balance_inference_max_drawdown_usd.png` | 58923 | Superseded balance-inference figure |
+| `reports/archive/balance_inference_max_profit_usd.png` | 54119 | Superseded balance-inference figure |
 | `tests/test_stage3_model.py` | 4643 | Frozen artifact, leakage, determinism, and hidden-data smoke tests |
 | `tests/test_features.py` | 18555 | Causal feature and lookahead tests |
-| `tests/test_ingest.py` | 2128 | Ingestion and collapse assertions |
+| `tests/test_ingest.py` | 2181 | Ingestion and collapse assertions |
 | `tests/test_splits.py` | 1911 | Split and purge assertions |
 | `C22 - Kickoff Recap (10 Jul 2026).pdf` | 11207 | C22 reference material |
 | `C22 veNTUre Programme Structure - July 2026.pdf` | 259381 | C22 reference material |
@@ -52,7 +57,7 @@ Raw campaign data and derived CSV exports are excluded by `.gitignore`.
 | `docs/figures/chart_3_fade_triggers.png` | 226867 | Prior analysis figure |
 | `docs/figures/chart_4_sizing_paradox.png` | 232338 | Prior analysis figure |
 | `.claude/settings.local.json` | 133 | Existing repository configuration |
-| `reports/submission_manifest.md` | 3963 | This manifest |
+| `reports/submission_manifest.md` | 4480 | This manifest |
 
 Validation: `pytest -q tests` passes all 20 tests. No tracked file contains an
 email-address pattern or raw IPv4 pattern. The word `telegram` appears only in
