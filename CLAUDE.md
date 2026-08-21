@@ -13,7 +13,8 @@ Solo entry, NTU veNTUre challenge. EDA memo due 24 Jul. See docs PDFs in repo ro
 - Fills collapse to positions on (campaignId, positionId); 46,520 -> 7,277
 - reverseProfit = -profit - 7.00*amount exactly (C41 test campaign: 6.50).
   Fade hurdle = $7/lot. Model target: gross_loss_per_lot = -profit/amount
-- Era break at C53: participation ~5x, SL usage -25pp, gross skill collapse.
+- Era break at C53: participation ~5x, position-weighted SL usage
+  -22.4pp (98.56% -> 76.16%), gross skill collapse.
   Primary era = C53-C65 (90% of volume). C33-C52 = prelude, report separately
 - Campaigns 41, 66 are n=1 test runs — exclude
 - Registration cap 500/campaign; ~6% activate. Trader stats must use ACTIVE traders

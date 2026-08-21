@@ -39,3 +39,19 @@ env/
 # --- Outputs that shouldn't be tracked ---
 *.log
 outputs/
+
+# --- exploratory artifacts outside the Stage 3 submission ---
+AGENTS.md
+balance_inference.py
+balance_verification.py
+ci_diagnosis.py
+feature_checks_walkforward.py
+repro_check.py
+reports/balance_*
+reports/dataset_update_diff.md
+reports/decay_and_cost_structure*
+reports/feature_prune_v21*
+reports/ingest_bug_diagnosis.md
+reports/mechanism_*
+reports/sl_leak_audit.md
+stage3_brief.pdf

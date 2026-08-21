@@ -1,0 +1,44 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\title{C22 veNTUre Stage 3 Submission}
+\author{Stage 3 frozen V2 model}
+\date{20 August 2026}
+
+\begin{document}
+\maketitle
+
+\section*{Submission summary}
+This submission provides a frozen, causal V2 Ridge model for the C22 veNTUre Stage 4 replay. It exposes one runtime function, \texttt{predict(trades\_df)}, and does not refit at prediction time. The model consumes trades in arrival order, handles unseen traders and missing entry features, and abstains by default.
+
+\section*{Data and validation}
+The repaired ingestion collapses 46,520 fills to 7,277 positions using the composite key (campaignId, positionId). The mandated Stage 3 training window is C33--C52 (694 positions); evaluation is C53--C66 (6,583 positions). The primary-era reference sample is C53--C65 (6,582 positions, 496 accounts, 13 campaigns).
+
+The admissible model excludes close-time SL/TP features and trader-history features. The target is reverseProfit per lot; the $7 cost is already included exactly once. Alpha is selected by inner expanding-campaign CV and biased one step toward additional regularisation. The frozen alpha is 3162.28.
+
+\section*{Decision rule}
+The acting rule is
+\[
+\mathrm{FADE} = (\mathrm{score} > \max(\mathrm{selected\ threshold},0))
+\land (\mathrm{win\_streak}\leq 1)
+\land (\mathrm{trades\_per\_hour}\leq 60).
+\]
+The offline support-selection threshold is -10, but the executable economic hurdle is zero. The executable threshold grid has maximum training support n=4, so the preregistered n$\geq$30 floor cannot be satisfied on the mandated training split.
+
+\section*{Evaluation}
+On C53--C65 the model acts on 177 positions (2.69\%) with equal-weighted mean +10.433 rP/lot. Its size-weighted result is -33.849 rP/lot, total realized rP is -\$3,556.81, and the account-clustered 95\% CI for the size-weighted mean is [-74.360, 1.166]. DO NOTHING is \$0; the model therefore does not beat it in absolute dollars.
+
+C66 contains 1,911 corrupted fills collapsed to one position with 462.30 lots. It is excluded from all dollar totals; its per-lot observation is retained only in the 178-trade C53--C66 power comparison.
+
+\section*{Power and limitations}
+The C53--C65 acting subset has 65 traderKey clusters and 55 IP clusters. After flooring negative ICC estimates at zero, the MDE is \$116.94/lot raw and \$101.59/lot winsorized. The observed +10.433 rP/lot is far below this floor and is not distinguishable from zero. The complete unfloored/floored acting-subset and coverage-frontier calculations are in \texttt{reports/stage3\_backtest.md}.
+
+\section*{Reproduction}
+Install the pinned requirements and run:
+\begin{verbatim}
+python reproduce_all.py --stage3 --datasets ./datasets
+\end{verbatim}
+The dataset path is supplied by the operator; raw datasets are not part of this submission.
+
+\end{document}

@@ -9,7 +9,7 @@ import pandas as pd
 from build_features import FEATURE_COLUMNS
 from splits import PRIMARY_CAMPAIGN_MAX, PRIMARY_CAMPAIGN_MIN, fold_attrition_report, make_folds
 
-BOOL_FEATURES = {"has_sl", "has_tp", "shared_ip"}
+BOOL_FEATURES = {"has_sl", "has_tp", "shared_ip", "is_cold_start"}
 CATEGORICAL_FEATURES = {"challenge_type"}
 CORRELATION_EXCLUDE = {"challenge_type"}
 
