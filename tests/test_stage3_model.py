@@ -21,7 +21,7 @@ def _synthetic_stream(n: int = 260) -> pd.DataFrame:
         rows.append(
             {
                 "campaignId": 53,
-                "accountId": "acct-1",
+                "accountId": "acct-1" if i % 2 else "acct-2",
                 "positionId": i,
                 "openDateTime": open_time,
                 "closeDateTime": open_time + timedelta(minutes=1),
@@ -30,7 +30,7 @@ def _synthetic_stream(n: int = 260) -> pd.DataFrame:
                 "ipClusterId": 7,
                 "sharedIpFlag": False,
                 "ip_cluster_size": 1,
-                "challenge_type": "standard",
+                "challenge_type": "11" if i % 2 else "unknown",
                 "gold_vol_prev_day": 0.02,
                 "amount": 0.2 + (i % 5) * 0.1,
                 "openPrice": 2000.0,
@@ -88,6 +88,11 @@ def test_close_only_column_is_rejected_if_added_to_feature_contract(monkeypatch)
         stage3_model._assert_no_feature_leakage()
 
 
+def test_feature_matrix_build_rejects_banned_column_in_read_values():
+    with pytest.raises(AssertionError, match="profit"):
+        stage3_model._feature_frame([{"profit": 1.0}])
+
+
 def test_recompute_after_truncation_is_byte_identical_for_200_positions():
     trades = _synthetic_stream()
     artifact = stage3_model._load_artifact()
@@ -116,3 +121,65 @@ def test_forbidden_input_columns_do_not_reach_entry_features():
     left = stage3_model._stream_features(with_close, artifact)[0]
     right = stage3_model._stream_features(without_close, artifact)[0]
     pd.testing.assert_frame_equal(left, right)
+
+
+def test_transformed_column_sidecar_matches_artifact_position_by_position():
+    artifact = stage3_model._load_artifact()
+    sidecar = stage3_model._load_transformed_column_contract()
+    assert len(sidecar) == 21
+    assert artifact["preprocessing"]["transformed_feature_names"] == sidecar
+    assert len(artifact["coefficients"]) == len(sidecar)
+
+
+def test_unseen_challenge_type_raises_at_predict_time():
+    trades = _synthetic_stream(4)
+    trades.loc[0, "challenge_type"] = "unseen-level"
+    with pytest.raises(ValueError, match="Unseen categorical level"):
+        stage3_model.predict(trades)
+
+
+def test_missing_expected_challenge_type_level_raises_at_matrix_contract():
+    artifact = stage3_model._load_artifact()
+    params = dict(artifact["preprocessing"])
+    params["categorical_categories"] = dict(params["categorical_categories"])
+    params["categorical_categories"]["challenge_type"] = ["11"]
+    with pytest.raises(AssertionError, match="missing=.*unknown"):
+        stage3_model._assert_categorical_contract(
+            params,
+            stage3_model._load_transformed_column_contract(),
+            context="test",
+        )
+
+
+def test_predict_missing_expected_challenge_type_level_raises():
+    trades = _synthetic_stream(4)
+    trades["challenge_type"] = "11"
+    with pytest.raises(ValueError, match="Missing expected categorical level"):
+        stage3_model.predict(trades)
+
+
+def test_permuting_input_columns_does_not_change_output():
+    trades = _synthetic_stream(12).drop(columns=["slPrice", "tpPrice"])
+    expected = stage3_model.predict(trades)
+    permuted = trades.loc[:, list(reversed(trades.columns))]
+    actual = stage3_model.predict(permuted)
+    pd.testing.assert_frame_equal(expected, actual)
+
+
+def test_shuffling_input_rows_preserves_per_trade_predictions():
+    trades = _synthetic_stream(18).drop(columns=["slPrice", "tpPrice"])
+    expected = stage3_model.predict(trades).set_index("position_key").sort_index()
+    shuffled = trades.sample(frac=1.0, random_state=123).reset_index(drop=True)
+    actual = stage3_model.predict(shuffled).set_index("position_key").sort_index()
+    pd.testing.assert_frame_equal(expected, actual)
+
+
+def test_seeded_causal_rebuild_is_bit_identical_for_sampled_state():
+    artifact = stage3_model._load_artifact()
+    result = stage3_model._assert_causal_rebuild(
+        _synthetic_stream(80).drop(columns=["slPrice", "tpPrice"]),
+        artifact,
+        sample_size=16,
+        seed=7,
+    )
+    assert result == {"sample_size": 16, "seed": 7, "state_rows": 80, "mismatches": 0}

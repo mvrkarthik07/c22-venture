@@ -2,8 +2,9 @@
 
 Date: 20 Aug 2026  
 Data: repaired ingestion, `46,520` fills -> `7,277` positions  
-Mandated split: fit/select on `C33-C52` (`694` positions, `330` accounts); evaluate on
-`C53-C66` (`6,583` positions, `496` accounts).  
+Mandated split: fit/select on `C33-C52` (`694` positions, `330` accounts); the
+corrected common evaluation is `C53-C65` (`6,582` positions, `496` accounts).
+C66 is retained only in explicitly marked historical diagnostics.
 Target: `reverseProfit per lot = gross_loss_per_lot - 7.00`; the `$7` cost is already
 inside the target and is subtracted exactly once. Hurdle: `0.00`.
 
@@ -440,14 +441,31 @@ mean of reverseProfit/lot; the size-weighted value is
 | C53-C65 | DO NOTHING | 6,582 | 100% | 0.000 | [0.000, 0.000] by construction | [0.000, 0.000] by construction |
 | C53-C65 | FADE EVERYTHING, equal-weighted | 6,582 | 100% | 5.436 | [-9.067, 20.258] | [-9.089, 20.217] |
 | C53-C65 | FADE EVERYTHING, size-weighted | 6,582 | 100% | -3.001 | [-11.037, 5.574] | [-11.504, 5.214] |
-| C53-C66 | DO NOTHING | 6,583 | 100% | 0.000 | [0.000, 0.000] by construction | [0.000, 0.000] by construction |
-| C53-C66 | FADE EVERYTHING, equal-weighted | 6,583 | 100% | 5.434 | [-9.067, 20.254] | [-9.089, 20.208] |
-| C53-C66 | FADE EVERYTHING, size-weighted | 6,583 | 100% | -3.587 | [-10.681, 4.427] | [-11.197, 4.244] |
+| historical C53-C66 (superseded) | DO NOTHING | 6,583 | 100% | 0.000 | [0.000, 0.000] by construction | [0.000, 0.000] by construction |
+| historical C53-C66 (superseded) | FADE EVERYTHING, equal-weighted | 6,583 | 100% | 5.434 | [-9.067, 20.254] | [-9.089, 20.208] |
+| historical C53-C66 (superseded) | FADE EVERYTHING, size-weighted | 6,583 | 100% | -3.587 | [-10.681, 4.427] | [-11.197, 4.244] |
 
-C66 contributes exactly one position. It changes the evaluation mean and the
-size-weighted baseline, but not the 496-account count. Any deployed model must
-beat both fade-everything baselines on the same weighting convention; a
-flagged-subset result alone is not a replacement for this policy comparison.
+C66 contributes exactly one position. The C53-C66 rows above are historical
+superseded diagnostics; the corrected C53-C65 baseline is the reporting scope
+used below. Any deployed model must beat both fade-everything baselines on the
+same weighting convention; a flagged-subset result alone is not a replacement
+for this policy comparison.
+
+### C66 coverage restatement
+
+| target / panel | superseded | corrected | delta pp |
+|---|---:|---:|---:|
+| V2 common | 178 / 6,583 = 2.7039% | 177 / 6,582 = 2.6892% | -0.0148 |
+| V3 common | 6 / 6,583 = 0.0911% | 5 / 6,582 = 0.0760% | -0.0151 |
+| 1% frontier | 66 / 6,583 = 1.0026% | 66 / 6,582 = 1.0027% | +0.0002 |
+| 2.7% frontier | 178 / 6,583 = 2.7039% | 177 / 6,582 = 2.6892% | -0.0148 |
+| 5% frontier | 329 / 6,583 = 4.9977% | 329 / 6,582 = 4.9985% | +0.0008 |
+| 10% frontier | 658 / 6,583 = 9.9954% | 658 / 6,582 = 9.9970% | +0.0015 |
+| 25% frontier | 1,646 / 6,583 = 25.0038% | 1,646 / 6,582 = 25.0076% | +0.0038 |
+| 50% frontier | 3,292 / 6,583 = 50.0076% | 3,291 / 6,582 = 50.0000% | -0.0076 |
+| 100% frontier | 5,616 / 6,583 = 85.3106% | 5,615 / 6,582 = 85.3084% | -0.0022 |
+| V2 IS / training | 4 / 694 = 0.5764% | 4 / 694 = 0.5764% | 0.0000 |
+| V3 IS / training | 2 / 694 = 0.2882% | 2 / 694 = 0.2882% | 0.0000 |
 
 ## 10. Interpretation and freeze decision
 

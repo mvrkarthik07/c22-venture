@@ -1,13 +1,35 @@
 # C22 veNTUre Stage 3 submission
 
-Reproduce the frozen V2 model, repaired ingestion, backtest, reports, and tests with:
+## Reproduce the submission
 
+After installing the locked environment and placing the permitted
+`traders_sanitized.csv` at the repository root, run this one regeneration
+command (the raw dataset may remain outside the clone):
+
+Install once:
 ```bash
-python reproduce_all.py --stage3 --datasets ./datasets
+python -m pip install --require-hashes -r requirements.lock
 ```
 
-`--datasets` is the path to C22's supplied campaign-data directory; it may be any
-local path and is not hardcoded.
+Regenerate everything covered by the runner:
+```bash
+python reproduce_all.py --stage3 --datasets /path/to/datasets --cache /path/to/cache/xauusd_daily_ohlc.csv
+```
+
+`--datasets` and `--cache` are local paths and are not hardcoded. On the
+submitted tag, this command took 119.46 s wall time on macOS arm64 with
+CPython 3.13.9 and passed 20 tests. It writes/rebuilds:
+`features.csv`, `features_v2.csv`, `reports/stage2_validation.md`,
+`reports/feature_prune_v21.md`, `reports/feature_prune_v21_heatmap.png`,
+`reports/mechanism_decomposition.md`, `reports/family_g_value.md`,
+`reports/design_annex_stats.md`, `artifacts/stage3_v2.json`,
+`reports/stage3_backtest.md`, and the ignored command log
+`reports/reproduce_all_commands.log`. The CSVs and raw/trader input files are
+intentionally not tracked.
+
+The lock resolves Python 3.13 dependencies with exact versions and hashes;
+see [requirements.lock](requirements.lock). The reproduction seed used by the
+production bootstrap and Stage 3 backtest is `7`.
 
 ## Stage 4 usage
 
@@ -37,7 +59,9 @@ decision per input row.
 - `reports/repro_check.md` — reproduction verification.
 - `stage3_report.pdf` — Current Stage 3 submission brief PDF.
 - `FEATURES.md`, `CLAUDE.md` — feature contract and project methodology.
-- `tests/` — the 20 ingestion, feature, split, leakage, determinism, and hidden-data smoke tests.
+- `tests/` — the submitted tag contains 20 ingestion, feature, split, leakage,
+  determinism, and hidden-data smoke tests; the current compliance worktree
+  contains 28 after eight additional checks.
 
 Raw `datasets/`, CSV exports, and trader metadata are intentionally excluded.
 

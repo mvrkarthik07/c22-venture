@@ -7,7 +7,9 @@ Target: reverseProfit per lot, with the $7 cost already included exactly once. H
 ## Frozen artifact and decision rule
 
 Artifact: `artifacts/stage3_v2.json` (`stage3-v2-2026-08-20`).
-Training window: C33-C52, n=694; evaluation: C53-C66, n=6,583.
+Training window: C33-C52, n=694; corrected common evaluation: C53-C65,
+n=6,582. C66 is excluded from coverage, per-lot metrics, dollar totals, and
+acted-lot bases.
 Inner alpha CV selected `1000`; the frozen alpha is `3162.28`, one half-decade step more regularised.
 Threshold grid: fixed -100 to 500 by 1; select maximum training mean rP/lot subject to n>=30. Selected score threshold: `-10.000`; effective execution threshold after the zero hurdle: `0.000`.
 Training threshold support: n=88 (12.68%).
@@ -22,27 +24,29 @@ Executable-grid re-selection (`0..500`, step 1): maximum training support is n=4
 
 ## Common-split performance
 
-Account CIs resample traderKey clusters; IP CIs are the secondary ipClusterId robustness check. Dollar totals below exclude corrupted C66; DO NOTHING acts on zero rows by construction.
+Account CIs resample accountId clusters; IP CIs are the secondary ipClusterId
+robustness check. Dollar totals below exclude corrupted C66; DO NOTHING acts on
+zero rows by construction.
 
 | model / baseline | n acted | coverage | mean rP/lot | account 95% CI | IP 95% CI | total realized rP ($) |
 |---|---:|---:|---:|---|---|---:|
 
 ### C53-C65 (6,582 positions)
 
-| Model (overrides) | 177 | 2.69% | 10.433 | [-52.786, 72.331] | [-45.183, 66.523] | -3556.810 |
-| Model (no overrides) | 183 | 2.78% | 10.452 | [-49.773, 70.475] | [-42.477, 64.403] | -3534.650 |
+| Model (overrides) | 177 | 2.6892% | 10.433 | [-46.117, 66.826] | [-45.183, 66.523] | -3556.810 |
+| Model (no overrides) | 183 | 2.78% | 10.452 | [-43.125, 64.704] | [-42.477, 64.403] | -3534.650 |
 | DO NOTHING | 0 | 0.00% | 0.000 | [0.000, 0.000] | [0.000, 0.000] | 0.000 |
-| FADE EVERYTHING, equal-weighted | 6582 | 100.00% | 5.436 | [-9.339, 20.713] | [-8.746, 20.384] | -12108.710 |
-| FADE EVERYTHING, size-weighted | 6582 | 100.00% | -3.001 | [-11.031, 5.381] | [-11.081, 5.245] | -12108.710 |
+| FADE EVERYTHING, equal-weighted | 6582 | 100.00% | 5.436 | [-8.572, 20.475] | [-8.746, 20.384] | -12108.710 |
+| FADE EVERYTHING, size-weighted | 6582 | 100.00% | -3.001 | [-10.493, 4.840] | [-11.081, 5.245] | -12108.710 |
 
 Size-weighted dollar economics (C66 excluded):
 
 | model / baseline | n | size-weighted mean rP/lot | account 95% CI | sum(amount) | total rP ($) |
 |---|---:|---:|---|---:|---:|
-| Model (overrides) | 177 | -33.849 | [-74.360, 1.166] | 105.08 | -3556.81 |
+| Model (overrides) | 177 | -33.849 | [-70.260, 2.964] | 105.08 | -3556.81 |
 | DO NOTHING | 0 | 0.000 | [0.000, 0.000] | 0.00 | 0.00 |
-| FADE EVERYTHING, equal-weighted | 6582 | -3.001 | [-11.031, 5.381] | 4034.37 | -12108.71 |
-| FADE EVERYTHING, size-weighted | 6582 | -3.001 | [-11.031, 5.381] | 4034.37 | -12108.71 |
+| FADE EVERYTHING, equal-weighted | 6582 | -3.001 | [-10.493, 4.840] | 4034.37 | -12108.71 |
+| FADE EVERYTHING, size-weighted | 6582 | -3.001 | [-10.493, 4.840] | 4034.37 | -12108.71 |
 
 The model captures 29.37% of the fade-everything dollar loss while acting on 2.69% of positions and 2.60% of total amount (10.92x the position-coverage share; 11.28x the amount share).
 Against DO NOTHING ($0 total rP), the model's total is $-3556.81: it does **not** beat DO NOTHING in absolute dollars.
@@ -71,22 +75,22 @@ Single-best-campaign check: the best acted-on campaign by mean was C53.
 |---|---:|---:|---:|---|---|---:|
 | Model, best campaign C53 removed | 172 | 2.84% | 5.691 | [-60.200, 66.313] | [-54.817, 62.697] | -3702.070 |
 
-### C53-C66 (6,583 positions; C66 excluded from dollar totals)
+### Corrected common scope: C53-C65 (6,582 positions)
 
-| Model (overrides) | 177 | 2.69% | 10.433 | [-52.786, 72.331] | [-45.183, 66.523] | -3556.810 |
-| Model (no overrides) | 183 | 2.78% | 10.452 | [-49.773, 70.475] | [-42.477, 64.403] | -3534.650 |
+| Model (overrides) | 177 | 2.6892% | 10.433 | [-46.117, 66.826] | [-45.183, 66.523] | -3556.810 |
+| Model (no overrides) | 183 | 2.78% | 10.452 | [-43.125, 64.704] | [-42.477, 64.403] | -3534.650 |
 | DO NOTHING | 0 | 0.00% | 0.000 | [0.000, 0.000] | [0.000, 0.000] | 0.000 |
-| FADE EVERYTHING, equal-weighted | 6582 | 100.00% | 5.436 | [-9.339, 20.713] | [-8.746, 20.384] | -12108.710 |
-| FADE EVERYTHING, size-weighted | 6582 | 100.00% | -3.001 | [-11.031, 5.381] | [-11.081, 5.245] | -12108.710 |
+| FADE EVERYTHING, equal-weighted | 6582 | 100.00% | 5.436 | [-8.572, 20.475] | [-8.746, 20.384] | -12108.710 |
+| FADE EVERYTHING, size-weighted | 6582 | 100.00% | -3.001 | [-10.493, 4.840] | [-11.081, 5.245] | -12108.710 |
 
 Size-weighted dollar economics (C66 excluded):
 
 | model / baseline | n | size-weighted mean rP/lot | account 95% CI | sum(amount) | total rP ($) |
 |---|---:|---:|---|---:|---:|
-| Model (overrides) | 177 | -33.849 | [-74.360, 1.166] | 105.08 | -3556.81 |
+| Model (overrides) | 177 | -33.849 | [-70.260, 2.964] | 105.08 | -3556.81 |
 | DO NOTHING | 0 | 0.000 | [0.000, 0.000] | 0.00 | 0.00 |
-| FADE EVERYTHING, equal-weighted | 6582 | -3.001 | [-11.031, 5.381] | 4034.37 | -12108.71 |
-| FADE EVERYTHING, size-weighted | 6582 | -3.001 | [-11.031, 5.381] | 4034.37 | -12108.71 |
+| FADE EVERYTHING, equal-weighted | 6582 | -3.001 | [-10.493, 4.840] | 4034.37 | -12108.71 |
+| FADE EVERYTHING, size-weighted | 6582 | -3.001 | [-10.493, 4.840] | 4034.37 | -12108.71 |
 
 The model captures 29.37% of the fade-everything dollar loss while acting on 2.69% of positions and 2.60% of total amount (10.92x the position-coverage share; 11.28x the amount share).
 Against DO NOTHING ($0 total rP), the model's total is $-3556.81: it does **not** beat DO NOTHING in absolute dollars.
@@ -119,7 +123,19 @@ Single-best-campaign check: the best acted-on campaign by mean was C53.
 
 C66 has 1911 fills collapsed to 1 position. The collapse currently uses `amount: sum` in `pipeline.to_positions()`; C66 therefore has position amount **462.30 lots** and total rP **$-4019.40**, or -8.694/lot.
 
-This is a C66-specific corrupted test export: its 1,911 fill amounts sum to 462.30 lots, versus a maximum collapsed amount of 6.50 lots in primary C53-C65. The SUM aggregation remains the intended operation for ordinary partial-close fills, and no other primary-era multi-fill position exceeds 6.50 lots. C66 is excluded from every dollar total in this report; its per-lot observation remains in the 178-trade evaluation/power comparison.
+This is a C66-specific corrupted test export: its 1,911 fill amounts sum to 462.30 lots, versus a maximum collapsed amount of 6.50 lots in primary C53-C65. The SUM aggregation remains the intended operation for ordinary partial-close fills, and no other primary-era multi-fill position exceeds 6.50 lots. C66 is excluded from every dollar total and from the corrected common per-lot comparison in this report. The historical full-predict 178-row C53-C66 diagnostic is superseded and retained only as provenance.
+
+### C66 coverage restatement
+
+| target | superseded | corrected |
+|---:|---:|---:|
+| 1% | 66/6,583 = 1.0026% | 66/6,582 = 1.0027% |
+| 2.7% | 178/6,583 = 2.7039% | 177/6,582 = 2.6892% |
+| 5% | 329/6,583 = 4.9977% | 329/6,582 = 4.9985% |
+| 10% | 658/6,583 = 9.9954% | 658/6,582 = 9.9970% |
+| 25% | 1,646/6,583 = 25.0038% | 1,646/6,582 = 25.0076% |
+| 50% | 3,292/6,583 = 50.0076% | 3,291/6,582 = 50.0000% |
+| 100% target | 5,616/6,583 = 85.3106% | 5,615/6,582 = 85.3084% |
 
 ## Expanding-window folds within C53-C65
 
@@ -149,9 +165,9 @@ Each fold fits V2, selects alpha and threshold using only its expanding training
 | window | n | coverage | mean rP/lot | account 95% CI |
 |---|---:|---:|---:|---|
 | Training C33-C52 | 4 | 0.58% | 50.897 | [-62.924, 193.331] |
-| Evaluation C53-C66 | 178 | 2.70% | 10.325 | [-52.204, 72.290] |
+| Evaluation C53-C65 | 177 | 2.6892% | 10.433 | [-46.117, 66.826] |
 
-The acted-on mean changes by -40.571 rP/lot from training to evaluation. This gap is the relevant Stage 4 survival warning: the training result is not evidence of a deployable edge unless it survives the mandated evaluation interval and the fold checks.
+The corrected acted-on mean changes by -40.464 rP/lot from training to evaluation. This gap is the relevant Stage 4 survival warning: the training result is not evidence of a deployable edge unless it survives the mandated evaluation interval and the fold checks.
 
 ## Decision-rule clarification
 

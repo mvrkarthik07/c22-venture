@@ -8,6 +8,7 @@ the explicit command-line reproduction path.
 from __future__ import annotations
 
 import argparse as _argparse
+import hashlib as _hashlib
 import json as _json
 import math as _math
 from pathlib import Path as _Path
@@ -29,7 +30,40 @@ _COST_PER_LOT = 7.0
 _START_BALANCE = 10000.0
 _BOOT_SEED = 7
 _N_BOOT = 2000
+_CAUSAL_SAMPLE_SIZE = 64
+_CAUSAL_SEED = 7
 _MDE_Z_SUM = 2.80158521811297  # z_(1-alpha/2) + z_(1-beta), alpha=.05, power=.80
+
+# This is a raw-column contract for the entry-time feature matrix.  These
+# fields may be present in a closed-position record for the post-decision
+# state update, but they must never be projected into the matrix constructed
+# for the current decision.
+BANNED_COLUMNS = frozenset(
+    {
+        "slPrice",
+        "tpPrice",
+        "reverseProfit",
+        "profit",
+        "netProfit",
+        "commission",
+        "closePrice",
+        "closeTime",
+        "closeDateTime",
+        "exit_type",
+        "durationSec",
+        "swap",
+        "closeTradeId",
+        "closeOrderId",
+        "exitType",
+        "pnl",
+        "gross_loss_per_lot",
+        "reverse_profit_per_lot",
+        "clears_hurdle",
+        "closeTradeCrossPrice",
+    }
+)
+_FORBIDDEN_CLOSE_COLUMNS = BANNED_COLUMNS
+_TRANSFORMED_COLUMN_SIDECAR = _ROOT / "artifacts" / "stage3_v2_transformed_columns.json"
 
 V2_FEATURES = [
     "loss_streak",
@@ -56,27 +90,6 @@ V2_FEATURES = [
 
 _NUMERIC_FEATURES = [f for f in V2_FEATURES if f != "challenge_type"]
 _CATEGORICAL_FEATURES = ["challenge_type"]
-_FORBIDDEN_CLOSE_COLUMNS = {
-    "slPrice",
-    "tpPrice",
-    "reverseProfit",
-    "profit",
-    "netProfit",
-    "commission",
-    "closePrice",
-    "closeTime",
-    "closeDateTime",
-    "exit_type",
-    "durationSec",
-    "swap",
-    "closeTradeId",
-    "closeOrderId",
-    "exitType",
-    "pnl",
-    "gross_loss_per_lot",
-    "reverse_profit_per_lot",
-    "clears_hurdle",
-}
 _ENTRY_COLUMNS = {
     "campaignId",
     "accountId",
@@ -97,6 +110,28 @@ _ENTRY_COLUMNS = {
     "openPrice",
     "side",
 }
+_FEATURE_FIELD_CLASSES: dict[str, frozenset[str]] = {
+    "loss_streak": frozenset({"close"}),
+    "win_streak": frozenset({"close"}),
+    "pnl_ewm": frozenset({"close"}),
+    "lot_zscore": frozenset({"open"}),
+    "amount": frozenset({"open"}),
+    "size_after_loss_delta": frozenset({"open", "close"}),
+    "sl_usage_rate_5": frozenset({"close"}),
+    "manual_exit_rate_5": frozenset({"close"}),
+    "pnl_pct": frozenset({"close"}),
+    "dd_from_peak_pct": frozenset({"close"}),
+    "trade_index": frozenset({"open"}),
+    "log_dt_close": frozenset({"close"}),
+    "trades_per_hour": frozenset({"open"}),
+    "prior_campaigns_x_loss_streak_ge_2": frozenset({"open", "close"}),
+    "shared_ip": frozenset({"open"}),
+    "ip_cluster_size": frozenset({"open"}),
+    "challenge_type": frozenset({"open"}),
+    "gold_vol_prev_day": frozenset({"open"}),
+    "same_direction_reentry": frozenset({"open", "close"}),
+    "size_delta_ratio": frozenset({"open"}),
+}
 _ALPHA_GRID = _np.logspace(-3, 3, 13)
 _THRESHOLD_GRID = _np.arange(-100.0, 501.0, 1.0)
 
@@ -116,6 +151,94 @@ def _artifact_path(path: str | _Path | None = None) -> _Path:
     return _Path(path) if path is not None else _DEFAULT_ARTIFACT
 
 
+def _artifact_sha256(path: str | _Path | None = None) -> str:
+    """Return a complete, length-checked SHA-256 digest for an artifact."""
+    artifact_path = _artifact_path(path)
+    digest = _hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+    if len(digest) != 64:
+        raise AssertionError(
+            f"artifact SHA-256 must contain 64 hexadecimal characters; got {len(digest)}"
+        )
+    return digest
+
+
+def _column_sidecar_path(artifact_path: str | _Path) -> _Path:
+    path = _Path(artifact_path)
+    return path.with_name(f"{path.stem}_transformed_columns.json")
+
+
+def _load_transformed_column_contract(artifact_path: str | _Path = _DEFAULT_ARTIFACT) -> list[str]:
+    sidecar = _column_sidecar_path(artifact_path)
+    if not sidecar.exists():
+        raise FileNotFoundError(
+            f"Transformed-column sidecar not found at {sidecar}; "
+            "the frozen prediction contract cannot be verified."
+        )
+    columns = _json.loads(sidecar.read_text(encoding="utf-8"))
+    if not isinstance(columns, list) or not all(isinstance(column, str) for column in columns):
+        raise AssertionError(f"Transformed-column sidecar must be a JSON string list: {sidecar}")
+    if len(columns) != len(set(columns)):
+        raise AssertionError("Transformed-column sidecar contains duplicate names")
+    return columns
+
+
+def _assert_transformed_column_contract(
+    actual: list[str],
+    expected: list[str],
+    *,
+    context: str,
+) -> None:
+    limit = max(len(actual), len(expected))
+    for index in range(limit):
+        actual_name = actual[index] if index < len(actual) else "<missing>"
+        expected_name = expected[index] if index < len(expected) else "<missing>"
+        if actual_name != expected_name:
+            raise AssertionError(
+                f"{context}: transformed-column mismatch at index {index}: "
+                f"constructed={actual_name!r}, expected={expected_name!r}"
+            )
+
+
+def _assert_feature_matrix_reads(columns: list[str] | tuple[str, ...], *, context: str) -> None:
+    offenders = sorted(BANNED_COLUMNS.intersection(columns))
+    if offenders:
+        raise AssertionError(
+            f"{context} read banned close-time columns: {', '.join(offenders)}"
+        )
+
+
+def _expected_categorical_levels(expected_columns: list[str]) -> dict[str, list[str]]:
+    levels: dict[str, list[str]] = {feature: [] for feature in _CATEGORICAL_FEATURES}
+    for name in expected_columns:
+        for feature in _CATEGORICAL_FEATURES:
+            prefix = f"cat__{feature}="
+            if name.startswith(prefix):
+                levels[feature].append(name[len(prefix) :])
+    return levels
+
+
+def _assert_categorical_contract(
+    params: dict[str, _Any],
+    expected_columns: list[str],
+    *,
+    context: str,
+) -> None:
+    expected = _expected_categorical_levels(expected_columns)
+    actual = {
+        feature: [str(level) for level in params.get("categorical_categories", {}).get(feature, [])]
+        for feature in _CATEGORICAL_FEATURES
+    }
+    for feature in _CATEGORICAL_FEATURES:
+        if actual[feature] != expected[feature]:
+            missing = [level for level in expected[feature] if level not in actual[feature]]
+            extra = [level for level in actual[feature] if level not in expected[feature]]
+            raise AssertionError(
+                f"{context}: categorical level contract mismatch for {feature!r}; "
+                f"missing={missing!r}, extra={extra!r}, "
+                f"constructed_order={actual[feature]!r}, expected_order={expected[feature]!r}"
+            )
+
+
 def _load_artifact(path: str | _Path | None = None) -> dict[str, _Any]:
     artifact_path = _artifact_path(path)
     if not artifact_path.exists():
@@ -130,6 +253,18 @@ def _load_artifact(path: str | _Path | None = None) -> dict[str, _Any]:
         )
     if artifact.get("feature_names") != V2_FEATURES:
         raise AssertionError("Frozen artifact feature set is not the exact V2 set")
+    expected_columns = _load_transformed_column_contract(artifact_path)
+    artifact_columns = artifact.get("preprocessing", {}).get("transformed_feature_names", [])
+    _assert_transformed_column_contract(
+        list(artifact_columns),
+        expected_columns,
+        context="frozen artifact",
+    )
+    _assert_categorical_contract(
+        artifact["preprocessing"],
+        expected_columns,
+        context="frozen artifact",
+    )
     return artifact
 
 
@@ -146,15 +281,18 @@ def _canonical_json_value(value: _Any) -> _Any:
 
 def _assert_no_feature_leakage() -> None:
     """Static guard: close-only fields may not be in the feature contract."""
-    for column in sorted(_FORBIDDEN_CLOSE_COLUMNS):
+    for column in sorted(BANNED_COLUMNS):
         if column in V2_FEATURES:
             raise AssertionError(f"Close-only column reached Stage 3 features: {column}")
-    if _FORBIDDEN_CLOSE_COLUMNS & _ENTRY_COLUMNS:
-        offending = sorted(_FORBIDDEN_CLOSE_COLUMNS & _ENTRY_COLUMNS)[0]
+    if BANNED_COLUMNS & _ENTRY_COLUMNS:
+        offending = sorted(BANNED_COLUMNS & _ENTRY_COLUMNS)[0]
         raise AssertionError(f"Close-only column reached Stage 3 entry projection: {offending}")
 
 
 def _feature_frame(values: list[dict[str, _Any]]) -> pd.DataFrame:
+    columns_actually_read = sorted({column for row in values for column in row})
+    _assert_feature_matrix_reads(columns_actually_read, context="feature-matrix build")
+    _assert_feature_matrix_reads(V2_FEATURES, context="feature-matrix contract")
     frame = pd.DataFrame(values, columns=V2_FEATURES)
     for feature in _NUMERIC_FEATURES:
         frame[feature] = pd.to_numeric(frame[feature], errors="coerce")
@@ -163,6 +301,7 @@ def _feature_frame(values: list[dict[str, _Any]]) -> pd.DataFrame:
 
 
 def _fit_transform_parameters(train: pd.DataFrame) -> tuple[dict[str, _Any], _np.ndarray]:
+    _assert_feature_matrix_reads(V2_FEATURES, context="fit feature-matrix build")
     medians: dict[str, float] = {}
     means: dict[str, float] = {}
     scales: dict[str, float] = {}
@@ -181,10 +320,19 @@ def _fit_transform_parameters(train: pd.DataFrame) -> tuple[dict[str, _Any], _np
         scales[feature] = scale
         transformed.append((filled - mean) / scale)
 
-    categories = {
-        feature: sorted(train[feature].map(_canonical_category).unique().tolist())
-        for feature in _CATEGORICAL_FEATURES
-    }
+    expected_columns = _load_transformed_column_contract()
+    expected_categories = _expected_categorical_levels(expected_columns)
+    categories: dict[str, list[str]] = {}
+    for feature in _CATEGORICAL_FEATURES:
+        observed = set(train[feature].map(_canonical_category).unique().tolist())
+        unseen = sorted(observed - set(expected_categories[feature]))
+        if unseen:
+            raise ValueError(
+                f"Unseen categorical level during fit for {feature!r}: {unseen!r}"
+            )
+        # Keep a zero-valued dummy when a fold has no observations of a
+        # contract level; never let a fold silently change matrix width.
+        categories[feature] = list(expected_categories[feature])
     for feature in _CATEGORICAL_FEATURES:
         values = train[feature].map(_canonical_category).to_numpy()
         for category in categories[feature]:
@@ -204,10 +352,54 @@ def _fit_transform_parameters(train: pd.DataFrame) -> tuple[dict[str, _Any], _np
             ],
         ],
     }
+    _assert_transformed_column_contract(
+        params["transformed_feature_names"],
+        expected_columns,
+        context="fit feature matrix",
+    )
+    _assert_categorical_contract(params, expected_columns, context="fit feature matrix")
     return params, _np.column_stack(transformed)
 
 
-def _transform(train_or_eval: pd.DataFrame, params: dict[str, _Any]) -> _np.ndarray:
+def _transform(
+    train_or_eval: pd.DataFrame,
+    params: dict[str, _Any],
+    *,
+    require_all_levels: bool = False,
+) -> _np.ndarray:
+    _assert_feature_matrix_reads(V2_FEATURES, context="prediction feature-matrix build")
+    expected_columns = _load_transformed_column_contract()
+    actual_columns = list(params.get("transformed_feature_names", []))
+    if not actual_columns:
+        actual_columns = [
+            *[f"num__{feature}" for feature in _NUMERIC_FEATURES],
+            *[
+                f"cat__{feature}={category}"
+                for feature in _CATEGORICAL_FEATURES
+                for category in params.get("categorical_categories", {}).get(feature, [])
+            ],
+        ]
+    _assert_transformed_column_contract(
+        actual_columns,
+        expected_columns,
+        context="prediction feature matrix",
+    )
+    _assert_categorical_contract(params, expected_columns, context="prediction feature matrix")
+    for feature in _CATEGORICAL_FEATURES:
+        observed = train_or_eval[feature].map(_canonical_category)
+        expected_levels = params["categorical_categories"][feature]
+        unseen = sorted(set(observed.tolist()) - set(expected_levels))
+        if unseen:
+            raise ValueError(
+                f"Unseen categorical level for {feature!r}: {unseen!r}; "
+                f"expected one of {expected_levels!r}"
+            )
+        missing = [level for level in expected_levels if level not in set(observed.tolist())]
+        if missing and require_all_levels:
+            raise ValueError(
+                f"Missing expected categorical level for {feature!r}: {missing!r}; "
+                "the prediction batch must contain every contract level"
+            )
     transformed: list[_np.ndarray] = []
     for feature in _NUMERIC_FEATURES:
         series = pd.to_numeric(train_or_eval[feature], errors="coerce")
@@ -249,8 +441,13 @@ def _fit_parameters(train: pd.DataFrame, alpha: float) -> dict[str, _Any]:
     return params
 
 
-def _predict_features(frame: pd.DataFrame, params: dict[str, _Any]) -> _np.ndarray:
-    return _transform(frame, params) @ _np.asarray(params["coefficients"], dtype=float) + float(
+def _predict_features(
+    frame: pd.DataFrame,
+    params: dict[str, _Any],
+    *,
+    require_all_levels: bool = False,
+) -> _np.ndarray:
+    return _transform(frame, params, require_all_levels=require_all_levels) @ _np.asarray(params["coefficients"], dtype=float) + float(
         params["intercept"]
     )
 
@@ -422,7 +619,7 @@ def _entry_position(row: pd.Series, prior_campaigns: int) -> dict[str, _Any]:
         "side": row.get("side", None),
         "prior_campaigns": int(prior_campaigns),
     }
-    offending = sorted(set(safe) & _FORBIDDEN_CLOSE_COLUMNS)
+    offending = sorted(set(safe) & BANNED_COLUMNS)
     if offending:
         raise AssertionError(f"Close-only column reached entry feature projection: {offending[0]}")
     return safe
@@ -519,9 +716,442 @@ def _stream_features(trades_df: pd.DataFrame, artifact: dict[str, _Any]) -> tupl
     return _feature_frame(feature_rows), metadata
 
 
+def _ordered_prediction_input(trades_df: pd.DataFrame) -> tuple[pd.DataFrame, _np.ndarray]:
+    """Canonicalize state-processing order while preserving output row order."""
+    if not isinstance(trades_df, pd.DataFrame):
+        raise TypeError("predict() requires a pandas DataFrame")
+    work = trades_df.copy()
+    work["__prediction_input_order"] = _np.arange(len(work), dtype=int)
+    sort_columns = [
+        column
+        for column in ("campaignId", "accountId", "openDateTime", "positionId")
+        if column in work.columns
+    ]
+    sort_columns.append("__prediction_input_order")
+    ordered = work.sort_values(sort_columns, kind="mergesort", na_position="last")
+    original_order = ordered["__prediction_input_order"].to_numpy(dtype=int)
+    return ordered.drop(columns=["__prediction_input_order"]), original_order
+
+
+def _assert_causal_rebuild(
+    trades_df: pd.DataFrame,
+    artifact: dict[str, _Any],
+    *,
+    sample_size: int = _CAUSAL_SAMPLE_SIZE,
+    seed: int = _CAUSAL_SEED,
+) -> dict[str, _Any]:
+    """Rebuild sampled targets from the prefix allowed by their entry time."""
+    ordered, _ = _ordered_prediction_input(trades_df)
+    timestamps = pd.to_datetime(ordered["openDateTime"], errors="coerce")
+    if timestamps.isna().any():
+        raise ValueError("Causal rebuild check requires non-missing openDateTime values")
+    full_features, _ = _stream_features(ordered, artifact)
+    n = len(ordered)
+    sample_n = min(int(sample_size), n)
+    rng = _np.random.default_rng(int(seed))
+    sampled = rng.choice(_np.arange(n), size=sample_n, replace=False) if sample_n else _np.array([], dtype=int)
+    for target_position in sampled.tolist():
+        target_time = timestamps.iloc[target_position]
+        allowed = (timestamps <= target_time).to_numpy(dtype=bool)
+        prefix = ordered.loc[allowed]
+        prefix_features, _ = _stream_features(prefix, artifact)
+        prefix_position = int(_np.flatnonzero(_np.flatnonzero(allowed) == target_position)[0])
+        left = prefix_features.iloc[prefix_position]
+        right = full_features.iloc[target_position]
+        for feature in V2_FEATURES:
+            left_value = left[feature]
+            right_value = right[feature]
+            both_nan = bool(pd.isna(left_value)) and bool(pd.isna(right_value))
+            if both_nan:
+                continue
+            if bool(pd.isna(left_value)) != bool(pd.isna(right_value)):
+                raise AssertionError(
+                    f"Causal rebuild mismatch at row {target_position}: "
+                    f"feature={feature!r}, magnitude=inf, prefix={left_value!r}, full={right_value!r}"
+                )
+            if feature in _CATEGORICAL_FEATURES:
+                if left_value != right_value:
+                    raise AssertionError(
+                        f"Causal rebuild mismatch at row {target_position}: "
+                        f"feature={feature!r}, magnitude=1, "
+                        f"prefix={left_value!r}, full={right_value!r}"
+                    )
+                continue
+            magnitude = abs(float(left_value) - float(right_value))
+            if magnitude != 0.0:
+                raise AssertionError(
+                    f"Causal rebuild mismatch at row {target_position}: "
+                    f"feature={feature!r}, magnitude={magnitude:.17g}, "
+                    f"prefix={left_value!r}, full={right_value!r}"
+                )
+    return {
+        "sample_size": sample_n,
+        "seed": int(seed),
+        "state_rows": n,
+        "mismatches": 0,
+    }
+
+
+def _close_time_causal_rebuild(
+    trades_df: pd.DataFrame,
+    artifact: dict[str, _Any],
+    *,
+    sample_size: int = _CAUSAL_SAMPLE_SIZE,
+    seed: int = _CAUSAL_SEED,
+) -> dict[str, _Any]:
+    """Compare full features with a strict prior-close-before-entry rebuild.
+
+    The target row is included only to compute its own feature vector; every
+    other row in each sampled rebuild must satisfy
+    ``close_time < target.openDateTime``.  This intentionally exposes the
+    concurrent-position dependence that an entry-time-only prefix check does
+    not remove.
+    """
+    ordered, _ = _ordered_prediction_input(trades_df)
+    open_times = pd.to_datetime(ordered["openDateTime"], errors="coerce")
+    if open_times.isna().any():
+        raise ValueError("Close-time causal rebuild requires non-missing openDateTime values")
+    close_values = pd.Series(_np.nan, index=ordered.index, dtype="object")
+    if "closeDateTime" in ordered.columns:
+        close_values = ordered["closeDateTime"].copy()
+    if "closeTime" in ordered.columns:
+        close_values = close_values.where(close_values.notna(), ordered["closeTime"])
+    close_times = pd.to_datetime(close_values, errors="coerce")
+    if close_times.isna().any():
+        raise ValueError("Close-time causal rebuild requires non-missing close_time values")
+
+    full_features, _ = _stream_features(ordered, artifact)
+    n = len(ordered)
+    sample_n = min(int(sample_size), n)
+    rng = _np.random.default_rng(int(seed))
+    sampled = rng.choice(_np.arange(n), size=sample_n, replace=False) if sample_n else _np.array([], dtype=int)
+    magnitudes: dict[str, list[float]] = {feature: [] for feature in V2_FEATURES}
+
+    for target_position in sampled.tolist():
+        target_time = open_times.iloc[target_position]
+        allowed = (close_times < target_time).to_numpy(dtype=bool)
+        allowed[target_position] = False
+        prior_positions = _np.flatnonzero(allowed)
+        strict = ordered.loc[allowed].copy()
+        strict["__causal_source_position"] = prior_positions
+        target = ordered.iloc[[target_position]].copy()
+        target["__causal_source_position"] = target_position
+        candidate = pd.concat([strict, target], ignore_index=True)
+        sort_columns = [
+            column
+            for column in ("campaignId", "accountId", "openDateTime", "positionId")
+            if column in candidate.columns
+        ]
+        sort_columns.extend(["__causal_source_position"])
+        candidate = candidate.sort_values(sort_columns, kind="mergesort", na_position="last")
+        target_candidate_position = int(
+            _np.flatnonzero(candidate["__causal_source_position"].to_numpy() == target_position)[0]
+        )
+        strict_features, _ = _stream_features(
+            candidate.drop(columns=["__causal_source_position"]),
+            artifact,
+        )
+        left = strict_features.iloc[target_candidate_position]
+        right = full_features.iloc[target_position]
+        for feature in V2_FEATURES:
+            left_value = left[feature]
+            right_value = right[feature]
+            if bool(pd.isna(left_value)) and bool(pd.isna(right_value)):
+                continue
+            if bool(pd.isna(left_value)) != bool(pd.isna(right_value)):
+                magnitudes[feature].append(float("inf"))
+                continue
+            if feature in _CATEGORICAL_FEATURES:
+                if left_value != right_value:
+                    magnitudes[feature].append(1.0)
+                continue
+            magnitude = abs(float(left_value) - float(right_value))
+            if magnitude != 0.0:
+                magnitudes[feature].append(magnitude)
+
+    summary: dict[str, dict[str, float | int]] = {}
+    for feature, values in magnitudes.items():
+        finite = [value for value in values if _np.isfinite(value)]
+        summary[feature] = {
+            "mismatches": len(values),
+            "finite_mismatches": len(finite),
+            "missingness_mismatches": len(values) - len(finite),
+            "max_finite_magnitude": float(max(finite)) if finite else 0.0,
+            "mean_finite_magnitude": float(_np.mean(finite)) if finite else 0.0,
+        }
+    return {
+        "sample_size": sample_n,
+        "seed": int(seed),
+        "state_rows": n,
+        "timestamp_rule": "prior close_time < target openDateTime",
+        "mismatches": summary,
+    }
+
+
+def _row_net_profit(row: pd.Series) -> float:
+    value = row.get("netProfit", _np.nan)
+    if _missing(value):
+        profit = row.get("profit", _np.nan)
+        if _missing(profit):
+            return float("nan")
+        commission = row.get("commission", 0.0)
+        swap = row.get("swap", 0.0)
+        commission = 0.0 if _missing(commission) else float(commission)
+        swap = 0.0 if _missing(swap) else float(swap)
+        value = float(profit) + commission + swap
+    return float(value) if not _missing(value) else float("nan")
+
+
+def _row_exit_type(row: pd.Series) -> _Any:
+    exit_type = row.get("exit_type", row.get("exitType", None))
+    if not _missing(exit_type):
+        return exit_type
+    close_price = row.get("closePrice", _np.nan)
+    sl_price = row.get("slPrice", _np.nan)
+    tp_price = row.get("tpPrice", _np.nan)
+    if not _missing(close_price) and not _missing(sl_price) and abs(float(close_price) - float(sl_price)) <= 1.0:
+        return "sl_hit"
+    if not _missing(close_price) and not _missing(tp_price) and abs(float(close_price) - float(tp_price)) <= 1.0:
+        return "tp_hit"
+    return "manual"
+
+
+def _welford_amount_stats(values: _Any) -> tuple[int, float, float]:
+    count = 0
+    mean = 0.0
+    m2 = 0.0
+    for value in values:
+        count += 1
+        delta = float(value) - mean
+        mean += delta / count
+        delta2 = float(value) - mean
+        m2 += delta * delta2
+    return count, mean, m2
+
+
+def _field_class_feature_row(
+    target: pd.Series,
+    prior_rows: pd.DataFrame,
+    artifact: dict[str, _Any],
+    *,
+    target_open: pd.Timestamp,
+    all_rows: pd.DataFrame | None = None,
+) -> dict[str, _Any]:
+    """Build one feature row with separate open- and close-field histories."""
+    if prior_rows.empty:
+        open_prior = prior_rows.copy()
+    else:
+        open_prior = prior_rows.loc[
+            pd.to_datetime(prior_rows["openDateTime"], errors="coerce") < target_open
+        ].copy()
+        open_prior = open_prior.sort_values(
+            [column for column in ("openDateTime", "positionId") if column in open_prior.columns],
+            kind="mergesort",
+        )
+    if open_prior.empty:
+        close_prior = open_prior.copy()
+    else:
+        close_values = open_prior["closeDateTime"] if "closeDateTime" in open_prior.columns else pd.Series(_np.nan, index=open_prior.index)
+        if "closeTime" in open_prior.columns:
+            close_values = close_values.where(close_values.notna(), open_prior["closeTime"])
+        close_times = pd.to_datetime(close_values, errors="coerce")
+        close_prior = open_prior.loc[close_times < target_open].copy()
+
+    current_amount = float(target["amount"])
+    amounts = pd.to_numeric(open_prior.get("amount", pd.Series(dtype=float)), errors="coerce").dropna().to_numpy(dtype=float)
+    amount_count, amount_mean, amount_m2 = _welford_amount_stats(amounts)
+    lot_zscore = _np.nan
+    if amount_count >= 3:
+        amount_std = _math.sqrt(amount_m2 / amount_count)
+        if amount_std > 0.0:
+            lot_zscore = (current_amount - amount_mean) / amount_std
+
+    close_nets = [_row_net_profit(row) for _, row in close_prior.iterrows()]
+    close_nets = [value for value in close_nets if _np.isfinite(value)]
+    loss_streak = 0
+    win_streak = 0
+    pnl_ewm = 0.0
+    cumulative = 0.0
+    peak = 0.0
+    for net_profit in close_nets:
+        if net_profit < 0:
+            loss_streak += 1
+            win_streak = 0
+        elif net_profit > 0:
+            loss_streak = 0
+            win_streak += 1
+        else:
+            loss_streak = 0
+            win_streak = 0
+        pnl_ewm = 0.3 * net_profit + 0.7 * pnl_ewm
+        cumulative += net_profit
+        peak = max(peak, cumulative)
+
+    size_after_loss_delta = _np.nan
+    if loss_streak > 0 and close_prior is not None:
+        negative_suffix_start = len(close_prior)
+        close_net_values = [_row_net_profit(row) for _, row in close_prior.iterrows()]
+        for index in range(len(close_net_values) - 1, -1, -1):
+            if _missing(close_net_values[index]) or float(close_net_values[index]) >= 0.0:
+                break
+            negative_suffix_start = index
+        if negative_suffix_start < len(close_prior):
+            first_loss_open = pd.to_datetime(
+                close_prior.iloc[negative_suffix_start]["openDateTime"], errors="coerce"
+            )
+            amount_before_loss = pd.to_numeric(
+                open_prior.loc[
+                    pd.to_datetime(open_prior["openDateTime"], errors="coerce") < first_loss_open,
+                    "amount",
+                ],
+                errors="coerce",
+            ).dropna()
+            if not amount_before_loss.empty:
+                _, mean_before_loss, _ = _welford_amount_stats(amount_before_loss.to_numpy(dtype=float))
+                size_after_loss_delta = current_amount - mean_before_loss
+
+    start_balance = float(artifact.get("start_balance", _START_BALANCE))
+    prior_campaigns = 0
+    trader_value = target.get("traderKey", _np.nan)
+    campaign_rows = all_rows if all_rows is not None else prior_rows
+    if not _missing(trader_value) and "traderKey" in campaign_rows.columns:
+        trader_mask = campaign_rows["traderKey"].astype("string").eq(str(trader_value))
+        open_values = pd.to_datetime(campaign_rows["openDateTime"], errors="coerce")
+        campaign_rows_open = campaign_rows.loc[trader_mask & (open_values < target_open)]
+        campaigns = pd.to_numeric(campaign_rows_open["campaignId"], errors="coerce").dropna()
+        prior_campaigns = int(campaigns.loc[campaigns < int(target["campaignId"])].nunique())
+
+    state_config = _state_config(target, prior_campaigns, artifact)
+    first_open = pd.to_datetime(open_prior["openDateTime"], errors="coerce").min() if not open_prior.empty else target_open
+    hours_since_first_open = max((target_open - first_open).total_seconds() / 3600.0, 1.0 / 60.0)
+    last_close_time = (
+        pd.to_datetime(close_prior["closeDateTime"], errors="coerce")
+        if "closeDateTime" in close_prior.columns
+        else pd.Series(dtype="datetime64[ns]")
+    )
+    if "closeTime" in close_prior.columns:
+        fallback_close = pd.to_datetime(close_prior["closeTime"], errors="coerce")
+        last_close_time = last_close_time.where(last_close_time.notna(), fallback_close)
+    log_dt_close = _np.nan
+    if not close_prior.empty and last_close_time.notna().any():
+        log_dt_close = _math.log1p(max((target_open - last_close_time.iloc[-1]).total_seconds(), 0.0))
+
+    sl_values = [not _missing(row.get("slPrice", _np.nan)) for _, row in close_prior.iterrows()]
+    manual_values = [_row_exit_type(row) == "manual" for _, row in close_prior.iterrows()]
+    sl_usage_rate_5 = float(_np.mean(sl_values[-5:])) if len(sl_values) >= 3 else _np.nan
+    manual_exit_rate_5 = float(_np.mean(manual_values[-5:])) if len(manual_values) >= 3 else _np.nan
+    last_open_side = open_prior.iloc[-1].get("side", None) if not open_prior.empty else None
+    last_close_net = _row_net_profit(close_prior.iloc[-1]) if not close_prior.empty else _np.nan
+    same_direction_reentry = int(
+        not _missing(last_close_net) and last_close_net < 0 and last_open_side == target.get("side", None)
+    )
+    size_delta_ratio = (
+        current_amount / float(open_prior.iloc[-1]["amount"])
+        if not open_prior.empty and not _missing(open_prior.iloc[-1].get("amount", _np.nan))
+        and float(open_prior.iloc[-1]["amount"]) != 0.0
+        else _np.nan
+    )
+    pnl_pct = cumulative / start_balance if start_balance else _np.nan
+    dd_from_peak_pct = (peak - cumulative) / start_balance if start_balance else _np.nan
+    return {
+        "loss_streak": loss_streak,
+        "win_streak": win_streak,
+        "pnl_ewm": pnl_ewm,
+        "lot_zscore": lot_zscore,
+        "amount": current_amount,
+        "size_after_loss_delta": size_after_loss_delta,
+        "sl_usage_rate_5": sl_usage_rate_5,
+        "manual_exit_rate_5": manual_exit_rate_5,
+        "pnl_pct": pnl_pct,
+        "dd_from_peak_pct": dd_from_peak_pct,
+        "trade_index": len(open_prior) + 1,
+        "log_dt_close": log_dt_close,
+        "trades_per_hour": (len(open_prior) + 1) / hours_since_first_open,
+        "prior_campaigns_x_loss_streak_ge_2": prior_campaigns * int(loss_streak >= 2),
+        "shared_ip": state_config["shared_ip"],
+        "ip_cluster_size": state_config["ip_cluster_size"],
+        "challenge_type": _canonical_category(state_config["challenge_type"]),
+        "gold_vol_prev_day": state_config["gold_vol_prev_day"],
+        "same_direction_reentry": same_direction_reentry,
+        "size_delta_ratio": size_delta_ratio,
+    }
+
+
+def _field_class_causal_rebuild(
+    trades_df: pd.DataFrame,
+    artifact: dict[str, _Any],
+    *,
+    sample_size: int = _CAUSAL_SAMPLE_SIZE,
+    seed: int = _CAUSAL_SEED,
+) -> dict[str, _Any]:
+    """Authoritative causal rebuild using each feature's field classes."""
+    ordered, _ = _ordered_prediction_input(trades_df)
+    open_times = pd.to_datetime(ordered["openDateTime"], errors="coerce")
+    if open_times.isna().any():
+        raise ValueError("Field-class rebuild requires non-missing openDateTime values")
+    full_features, _ = _stream_features(ordered, artifact)
+    n = len(ordered)
+    sample_n = min(int(sample_size), n)
+    rng = _np.random.default_rng(int(seed))
+    sampled = rng.choice(_np.arange(n), size=sample_n, replace=False) if sample_n else _np.array([], dtype=int)
+    magnitudes: dict[str, list[float]] = {feature: [] for feature in V2_FEATURES}
+
+    for target_position in sampled.tolist():
+        target = ordered.iloc[target_position]
+        target_open = open_times.iloc[target_position]
+        campaign_mask = ordered["campaignId"].eq(target["campaignId"])
+        account_value = target["accountId"]
+        if _missing(account_value):
+            account_mask = ordered.index.to_series().eq(ordered.index[target_position])
+        else:
+            account_mask = ordered["accountId"].eq(account_value)
+        prior_rows = ordered.loc[campaign_mask & account_mask]
+        rebuilt = _field_class_feature_row(
+            target,
+            prior_rows,
+            artifact,
+            target_open=target_open,
+            all_rows=ordered,
+        )
+        full = full_features.iloc[target_position]
+        for feature in V2_FEATURES:
+            left_value = rebuilt[feature]
+            right_value = full[feature]
+            if bool(pd.isna(left_value)) and bool(pd.isna(right_value)):
+                continue
+            if bool(pd.isna(left_value)) != bool(pd.isna(right_value)):
+                magnitudes[feature].append(float("inf"))
+                continue
+            if feature in _CATEGORICAL_FEATURES:
+                if left_value != right_value:
+                    magnitudes[feature].append(1.0)
+                continue
+            magnitude = abs(float(left_value) - float(right_value))
+            if magnitude != 0.0:
+                magnitudes[feature].append(magnitude)
+
+    summary: dict[str, dict[str, float | int]] = {}
+    for feature, values in magnitudes.items():
+        finite = [value for value in values if _np.isfinite(value)]
+        summary[feature] = {
+            "mismatches": len(values),
+            "finite_mismatches": len(finite),
+            "missingness_mismatches": len(values) - len(finite),
+            "max_finite_magnitude": float(max(finite)) if finite else 0.0,
+            "mean_finite_magnitude": float(_np.mean(finite)) if finite else 0.0,
+        }
+    return {
+        "sample_size": sample_n,
+        "seed": int(seed),
+        "state_rows": n,
+        "field_classes": {feature: sorted(classes) for feature, classes in _FEATURE_FIELD_CLASSES.items()},
+        "mismatches": summary,
+    }
+
+
 def _contribution_strings(features: pd.DataFrame, artifact: dict[str, _Any]) -> list[str]:
     params = artifact["preprocessing"]
-    matrix = _transform(features, params)
+    matrix = _transform(features, params, require_all_levels=True)
     coefficients = _np.asarray(artifact["coefficients"], dtype=float)
     names = params["transformed_feature_names"]
     output: list[str] = []
@@ -538,10 +1168,15 @@ def _decision_output(
     *,
     apply_overrides: bool = True,
 ) -> pd.DataFrame:
-    scores = _predict_features(feature_frame, artifact["preprocessing"] | {
+    prediction_params = artifact["preprocessing"] | {
         "coefficients": artifact["coefficients"],
         "intercept": artifact["intercept"],
-    })
+    }
+    scores = _predict_features(
+        feature_frame,
+        prediction_params,
+        require_all_levels=True,
+    )
     # The selection threshold is learned from training support, but the
     # economic hurdle is non-negotiable: never fade a negative predicted rP.
     threshold = max(float(artifact["selected_threshold"]), float(artifact.get("hurdle", _HURDLE)))
@@ -575,8 +1210,11 @@ def _predict_internal(
     *,
     apply_overrides: bool = True,
 ) -> pd.DataFrame:
-    features, metadata = _stream_features(trades_df, artifact)
-    return _decision_output(features, metadata, artifact, apply_overrides=apply_overrides)
+    ordered, original_order = _ordered_prediction_input(trades_df)
+    features, metadata = _stream_features(ordered, artifact)
+    output = _decision_output(features, metadata, artifact, apply_overrides=apply_overrides)
+    inverse = _np.argsort(original_order, kind="stable")
+    return output.iloc[inverse].reset_index(drop=True)
 
 
 def _prepare_backtest_positions(
@@ -617,10 +1255,27 @@ def _backtest_predictions(positions: pd.DataFrame, artifact: dict[str, _Any]) ->
     return result
 
 
+def _common_split_evaluation(backtest: pd.DataFrame) -> pd.DataFrame:
+    """Return the full C53-C66 common split, including the C66 audit row."""
+    return backtest.loc[backtest["campaignId"].between(53, 66)].copy()
+
+
+def _common_split_economic(backtest: pd.DataFrame) -> pd.DataFrame:
+    """Return common-split rows eligible for dollar totals (C66 excluded)."""
+    return _common_split_evaluation(backtest).loc[lambda frame: frame["campaignId"].ne(66)].copy()
+
+
 def _cluster_series(frame: pd.DataFrame, kind: str) -> pd.Series:
-    if kind == "account":
+    if kind in {"traderKey", "trader", "legacy_account"}:
         fallback = "account::" + frame["campaignId"].astype(str) + "::" + frame["accountId"].astype(str)
         return frame["traderKey"].astype("string").where(frame["traderKey"].notna(), fallback)
+    if kind == "account":
+        # accountId is the mandated resampling unit.  It is stable across
+        # campaigns in the supplied schema; missing IDs fall back to a
+        # campaign-qualified singleton rather than becoming one shared NaN
+        # cluster.
+        fallback = "missing-account::" + frame["campaignId"].astype(str) + "::" + frame.index.astype(str)
+        return frame["accountId"].astype("string").where(frame["accountId"].notna(), fallback)
     if kind == "ip":
         fallback = "account::" + frame["campaignId"].astype(str) + "::" + frame["accountId"].astype(str)
         return frame["ipClusterId"].astype("string").where(frame["ipClusterId"].notna(), fallback)
@@ -634,28 +1289,51 @@ def _cluster_bootstrap(
     *,
     size_weighted: bool = False,
 ) -> tuple[float, float]:
+    """Cluster bootstrap a selected metric.
+
+    ``cluster_kind='account'`` is the C22-compliant implementation.  The
+    prior traderKey-based implementation remains available explicitly as
+    ``cluster_kind='traderKey'`` for before/after reconciliation.
+    """
     selected = frame.loc[_np.asarray(mask, dtype=bool)].copy()
     if selected.empty:
         return 0.0, 0.0
-    work = frame[["campaignId", "accountId", "traderKey", "ipClusterId", "actual_rp_per_lot", "amount"]].copy()
-    work["cluster"] = _cluster_series(work, cluster_kind).to_numpy()
-    work["_selected"] = _np.asarray(mask, dtype=bool)
-    grouped = work.groupby("cluster", sort=False, dropna=False)
-    selected_sum = grouped.apply(
-        lambda group: float((group.loc[group["_selected"], "actual_rp_per_lot"]).sum()),
-        include_groups=False,
-    ).to_numpy(dtype=float)
-    selected_count = grouped["_selected"].sum().to_numpy(dtype=float)
-    selected_absolute = grouped.apply(
-        lambda group: float((group.loc[group["_selected"], "actual_absolute_rp"]).sum())
-        if "actual_absolute_rp" in group
-        else float((group.loc[group["_selected"], "actual_rp_per_lot"] * group.loc[group["_selected"], "amount"]).sum()),
-        include_groups=False,
-    ).to_numpy(dtype=float)
-    selected_amount = grouped.apply(
-        lambda group: float(group.loc[group["_selected"], "amount"].sum()),
-        include_groups=False,
-    ).to_numpy(dtype=float)
+    columns = ["campaignId", "accountId", "traderKey", "ipClusterId", "actual_rp_per_lot", "amount"]
+    legacy = cluster_kind in {"traderKey", "trader", "legacy_account"}
+    if legacy:
+        # Exact pre-C22 implementation, retained for the before/after table.
+        work = frame[columns].copy()
+        work["cluster"] = _cluster_series(work, cluster_kind).to_numpy()
+        work["_selected"] = _np.asarray(mask, dtype=bool)
+        grouped = work.groupby("cluster", sort=False, dropna=False)
+        selected_sum = grouped.apply(
+            lambda group: float(group.loc[group["_selected"], "actual_rp_per_lot"].sum()),
+            include_groups=False,
+        ).to_numpy(dtype=float)
+        selected_count = grouped["_selected"].sum().to_numpy(dtype=float)
+        selected_absolute = grouped.apply(
+            lambda group: float(
+                (group.loc[group["_selected"], "actual_rp_per_lot"] * group.loc[group["_selected"], "amount"]).sum()
+            ),
+            include_groups=False,
+        ).to_numpy(dtype=float)
+        selected_amount = grouped.apply(
+            lambda group: float(group.loc[group["_selected"], "amount"].sum()),
+            include_groups=False,
+        ).to_numpy(dtype=float)
+    else:
+        # C22 implementation: select accounts first, then resample each
+        # selected account with replacement and retain all its selected trades.
+        work = selected[columns].copy()
+        work["cluster"] = _cluster_series(work, cluster_kind).to_numpy()
+        grouped = work.groupby("cluster", sort=False, dropna=False)
+        selected_sum = grouped["actual_rp_per_lot"].sum().to_numpy(dtype=float)
+        selected_count = grouped["actual_rp_per_lot"].size().to_numpy(dtype=float)
+        selected_absolute = grouped.apply(
+            lambda group: float((group["actual_rp_per_lot"] * group["amount"]).sum()),
+            include_groups=False,
+        ).to_numpy(dtype=float)
+        selected_amount = grouped["amount"].sum().to_numpy(dtype=float)
     groups = len(selected_sum)
     rng = _np.random.default_rng(_BOOT_SEED)
     samples: list[float] = []
@@ -682,6 +1360,7 @@ def _metric_row(
     *,
     label: str,
     size_weighted: bool = False,
+    account_cluster_kind: str = "account",
 ) -> dict[str, _Any]:
     mask = _np.asarray(mask, dtype=bool)
     selected = frame.loc[mask]
@@ -695,7 +1374,12 @@ def _metric_row(
             mean = float(selected["actual_rp_per_lot"].mean())
     else:
         mean = 0.0
-    account_ci = _cluster_bootstrap(frame, mask, "account", size_weighted=size_weighted)
+    account_ci = _cluster_bootstrap(
+        frame,
+        mask,
+        account_cluster_kind,
+        size_weighted=size_weighted,
+    )
     ip_ci = _cluster_bootstrap(frame, mask, "ip", size_weighted=size_weighted)
     return {
         "label": label,
@@ -911,9 +1595,12 @@ def _executable_selection(features_path: str, artifact: dict[str, _Any]) -> dict
 
 
 def _frontier_cluster_labels(frame: pd.DataFrame, kind: str) -> pd.Series:
-    if kind == "account":
+    if kind in {"traderKey", "trader", "legacy_account"}:
         fallback = "account::" + frame["campaignId"].astype(str) + "::" + frame["accountId"].astype(str)
         return frame["traderKey"].astype("object").where(frame["traderKey"].notna(), fallback)
+    if kind == "account":
+        fallback = "missing-account::" + frame["campaignId"].astype(str) + "::" + frame.index.astype(str)
+        return frame["accountId"].astype("object").where(frame["accountId"].notna(), fallback)
     if kind == "ip":
         valid = frame["ipClusterId"].notna() & (frame["ipClusterId"] != -1)
         fallback = "account::" + frame["campaignId"].astype(str) + "::" + frame["accountId"].astype(str)
@@ -1104,16 +1791,18 @@ def _render_stage3_report(
         "",
         "## Common-split performance",
         "",
-        "Account CIs resample traderKey clusters; IP CIs are the secondary ipClusterId robustness check. Dollar totals below exclude corrupted C66; DO NOTHING acts on zero rows by construction.",
+        "Account CIs resample accountId clusters; IP CIs are the secondary ipClusterId robustness check. Dollar totals below exclude corrupted C66; DO NOTHING acts on zero rows by construction.",
         "",
         "| model / baseline | n acted | coverage | mean rP/lot | account 95% CI | IP 95% CI | total realized rP ($) |",
         "|---|---:|---:|---:|---|---|---:|",
     ]
     for window, title in (("C53-C65", "C53-C65 (6,582 positions)"), ("C53-C66", "C53-C66 (6,583 positions; C66 excluded from dollar totals)")):
         lines.extend([f"", f"### {title}", ""])
-        subset = backtest.loc[backtest["campaignId"].between(53, 65 if window == "C53-C65" else 66)].copy()
-        if window == "C53-C66":
-            subset = subset.loc[subset["campaignId"] != 66].copy()
+        subset = (
+            backtest.loc[backtest["campaignId"].between(53, 65)].copy()
+            if window == "C53-C65"
+            else _common_split_economic(backtest)
+        )
         for label, mask, weighted in (
             ("Model (overrides)", subset["decision"].eq("FADE"), False),
             ("Model (no overrides)", subset["base_decision"].eq("FADE"), False),
@@ -1381,9 +2070,10 @@ def _run_backtest(args: _Any) -> None:
 def predict(trades_df: pd.DataFrame) -> pd.DataFrame:
     """Predict one deterministic Stage 3 decision per input trade.
 
-    Rows are consumed in their existing order.  Entry-time features are
-    computed first; if a closed outcome is present, it is applied only after
-    that row's decision to update the account state for later rows.
+    Rows are canonically processed by campaign, account, entry timestamp, and
+    position ID, then returned in the caller's row order.  Entry-time features
+    are computed first; if a closed outcome is present, it is applied only
+    after that row's decision to update the account state for later rows.
     """
     _assert_no_feature_leakage()
     artifact = _load_artifact()
@@ -1401,6 +2091,8 @@ def _main() -> None:
     parser.add_argument("--cache", default="cache/xauusd_daily_ohlc.csv")
     parser.add_argument("--out", default="reports/stage3_backtest.md")
     parser.add_argument("--print-artifact", action="store_true")
+    parser.add_argument("--print-artifact-sha256", action="store_true")
+    parser.add_argument("--causal-check", action="store_true")
     args = parser.parse_args()
     if args.fit_artifact:
         artifact = _fit_artifact(args.features, args.artifact)
@@ -1414,6 +2106,13 @@ def _main() -> None:
         _run_backtest(args)
     elif args.print_artifact:
         print(_json.dumps(_load_artifact(args.artifact), indent=2, sort_keys=True))
+    elif args.print_artifact_sha256:
+        print(_artifact_sha256(args.artifact))
+    elif args.causal_check:
+        artifact = _load_artifact(args.artifact)
+        positions = _prepare_backtest_positions(args.datasets, args.traders, args.cache)
+        result = _field_class_causal_rebuild(positions, artifact)
+        print(_json.dumps(result, sort_keys=True))
     else:
         parser.error("choose --fit-artifact or --print-artifact")
 
