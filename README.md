@@ -57,7 +57,7 @@ decision per input row.
 - `reports/sl_leak_audit_v2.md` — refreshed stop-loss leakage audit.
 - `reports/feature_checks_walkforward.md` — walk-forward feature checks.
 - `reports/repro_check.md` — reproduction verification.
-- `stage3_report.pdf` — Current Stage 3 submission brief PDF.
+- `stage3_KarthikManda.pdf` — Current Stage 3 submission brief PDF.
 - `FEATURES.md`, `CLAUDE.md` — feature contract and project methodology.
 - `tests/` — the submitted tag contains 20 ingestion, feature, split, leakage,
   determinism, and hidden-data smoke tests; the current compliance worktree
