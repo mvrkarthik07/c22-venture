@@ -3,15 +3,25 @@ from __future__ import annotations
 import argparse
 import gzip
 from pathlib import Path
+from typing import Any, Mapping
 
 import numpy as np
 import pandas as pd
 import requests
 
-from features import TraderState
-from pipeline import infer_exit_type, load_all_trades, to_positions
+from features import TraderHistory, TraderState
+from pipeline import (
+    BREACH_THRESHOLD_USD,
+    HURDLE,
+    STARTING_BALANCE,
+    TARGET_THRESHOLD_USD,
+    infer_exit_type,
+    load_all_trades,
+    reverse_profit_per_lot,
+    to_positions,
+)
+from splits import PRIMARY_CAMPAIGN_MAX, PRIMARY_CAMPAIGN_MIN
 
-HURDLE = 7.0
 FOREXSB_INFO_URL = "https://data.forexsb.com/datafeed/info/premium.json.gz"
 FOREXSB_XAUUSD_M30_URL = "https://data.forexsb.com/datafeed/data/dukascopy/XAUUSD30.lb.gz"
 DEFAULT_CACHE_PATH = Path("cache/xauusd_daily_ohlc.csv")
@@ -35,11 +45,34 @@ FEATURE_COLUMNS = [
     "log_dt_close",
     "trades_per_hour",
     "prior_campaigns",
+    "prior_campaigns_x_loss_streak_ge_2",
     "shared_ip",
     "ip_cluster_size",
     "challenge_type",
     "gold_vol_prev_day",
+    "sl_widening_delta",
+    "same_direction_reentry",
+    "size_delta_ratio",
+    "trader_prior_tilt",
+    "trader_prior_sl_discipline",
+    "trader_prior_survival",
 ]
+
+COMPANION_BALANCE_COLUMNS = [
+    "cum_pnl_usd",
+    "dd_from_peak_usd",
+]
+
+SUPPLEMENTAL_FEATURE_COLUMNS = [
+    "breach_proximity_usd",
+    "target_proximity_usd",
+]
+ALL_FEATURE_COLUMNS = (
+    FEATURE_COLUMNS
+    + ["entry_gap_sec", "is_cold_start"]
+    + COMPANION_BALANCE_COLUMNS
+    + SUPPLEMENTAL_FEATURE_COLUMNS
+)
 
 IDENTIFIER_COLUMNS = [
     "campaignId",
@@ -54,6 +87,7 @@ IDENTIFIER_COLUMNS = [
 
 TARGET_COLUMNS = [
     "gross_loss_per_lot",
+    "reverse_profit_per_lot",
     "clears_hurdle",
 ]
 
@@ -64,7 +98,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--traders", default="traders_sanitized.csv", help="Path to traders_sanitized.csv")
     parser.add_argument("--out", default=str(DEFAULT_OUT_PATH), help="Output CSV path")
     parser.add_argument("--cache", default=str(DEFAULT_CACHE_PATH), help="Cached XAUUSD daily OHLC CSV path")
-    parser.add_argument("--balance", type=float, default=10000.0, help="Start balance per account")
+    parser.add_argument(
+        "--balance",
+        type=float,
+        default=STARTING_BALANCE,
+        help="Confirmed starting balance per account",
+    )
+    parser.add_argument(
+        "--trader-history-k",
+        type=float,
+        default=5.0,
+        help="Empirical-Bayes shrinkage hyperparameter for cross-campaign trader history",
+    )
     return parser.parse_args()
 
 
@@ -182,7 +227,112 @@ def attach_gold_vol_prev_day(positions: pd.DataFrame, daily_ohlc: pd.DataFrame) 
     return positions
 
 
-def build_feature_rows(positions: pd.DataFrame, trader_meta: pd.DataFrame, start_balance: float) -> pd.DataFrame:
+def fit_trader_history_params(
+    positions: pd.DataFrame,
+    trader_meta: pd.DataFrame,
+    start_balance: float,
+    *,
+    shrinkage_k: float = 5.0,
+) -> dict[str, float]:
+    base_rows = _build_feature_rows_internal(
+        positions,
+        trader_meta,
+        start_balance,
+        trader_history_params=None,
+        use_trader_history=False,
+    )
+
+    tilt_mask = base_rows["loss_streak"] >= 2
+    trader_prior_tilt = base_rows.loc[tilt_mask, "gross_loss_per_lot"].mean()
+    trader_prior_sl_discipline = base_rows["sl_distance_pct"].mean()
+
+    history_entity = base_rows["traderKey"].astype("object").where(
+        base_rows["traderKey"].notna(),
+        base_rows["campaignId"].astype(str) + "::" + base_rows["accountId"].astype(str),
+    )
+    survival = (
+        base_rows.assign(_history_entity=history_entity)
+        .groupby(["campaignId", "_history_entity"], dropna=False)
+        .agg(first_open=("openDateTime", "min"), last_close=("closeDateTime", "max"))
+        .reset_index()
+    )
+    trader_prior_survival = np.nan
+    if not survival.empty:
+        spans = (
+            survival["last_close"] - survival["first_open"]
+        ).dt.total_seconds() / 3600.0
+        trader_prior_survival = (spans / TraderHistory.SURVIVAL_SPAN_MEDIAN_HOURS).mean()
+
+    return {
+        "shrinkage_k": float(shrinkage_k),
+        "population_trader_prior_tilt": float(trader_prior_tilt)
+        if pd.notna(trader_prior_tilt)
+        else np.nan,
+        "population_trader_prior_sl_discipline": float(trader_prior_sl_discipline)
+        if pd.notna(trader_prior_sl_discipline)
+        else np.nan,
+        "population_trader_prior_survival": float(trader_prior_survival)
+        if pd.notna(trader_prior_survival)
+        else np.nan,
+    }
+
+
+def build_feature_rows(
+    positions: pd.DataFrame,
+    trader_meta: pd.DataFrame,
+    start_balance: float,
+    *,
+    trader_history_params: Mapping[str, Any] | None = None,
+) -> pd.DataFrame:
+    resolved_history_params = _resolve_trader_history_params(
+        positions,
+        trader_meta,
+        start_balance,
+        trader_history_params,
+    )
+    return _build_feature_rows_internal(
+        positions,
+        trader_meta,
+        start_balance,
+        trader_history_params=resolved_history_params,
+        use_trader_history=True,
+    )
+
+
+def _resolve_trader_history_params(
+    positions: pd.DataFrame,
+    trader_meta: pd.DataFrame,
+    start_balance: float,
+    trader_history_params: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    resolved = dict(trader_history_params or {})
+    required_keys = {
+        "population_trader_prior_tilt",
+        "population_trader_prior_sl_discipline",
+        "population_trader_prior_survival",
+    }
+    if required_keys.issubset(resolved.keys()):
+        resolved.setdefault("shrinkage_k", 5.0)
+        return resolved
+
+    fitted = fit_trader_history_params(
+        positions,
+        trader_meta,
+        start_balance,
+        shrinkage_k=float(resolved.get("shrinkage_k", 5.0)),
+    )
+    fitted.update(resolved)
+    return fitted
+
+
+def _build_feature_rows_internal(
+    positions: pd.DataFrame,
+    trader_meta: pd.DataFrame,
+    start_balance: float,
+    *,
+    trader_history_params: Mapping[str, Any] | None,
+    use_trader_history: bool,
+) -> pd.DataFrame:
     positions = positions.merge(
         trader_meta,
         on=["campaignId", "accountId"],
@@ -194,54 +344,152 @@ def build_feature_rows(positions: pd.DataFrame, trader_meta: pd.DataFrame, start
     ).reset_index(drop=True)
 
     rows = []
-    for (_, _), group in positions.groupby(["campaignId", "accountId"], sort=False):
-        first = group.iloc[0]
-        state = TraderState(
-            {
-                "start_balance": start_balance,
-                "campaign_id": first["campaignId"],
-                "campaign_date": first["campaignDate"],
-                "trader_key": first["traderKey"],
-                "prior_campaigns": int(first["prior_campaigns"]) if pd.notna(first["prior_campaigns"]) else 0,
-                "shared_ip": bool(first["sharedIpFlag"]) if pd.notna(first["sharedIpFlag"]) else False,
-                "ip_cluster_size": first["ip_cluster_size"],
-                "challenge_type": first["challenge_type"],
-                "gold_vol_prev_day": first["gold_vol_prev_day"],
-            }
-        )
+    trader_histories: dict[str, TraderHistory] = {}
+    history_config = dict(trader_history_params or {})
 
-        for position in group.to_dict("records"):
-            features = state.compute_features(position)
-            gross_loss_per_lot = (
-                -float(position["profit"]) / float(position["amount"])
-                if float(position["amount"]) != 0.0
-                else np.nan
+    for campaign_id, campaign_group in positions.groupby("campaignId", sort=True):
+        campaign_rows: list[dict[str, Any]] = []
+        for (_, _), account_group in campaign_group.groupby(["campaignId", "accountId"], sort=False):
+            first = account_group.iloc[0]
+            history_features = _history_features_for_campaign(
+                first,
+                current_campaign_id=int(campaign_id),
+                trader_histories=trader_histories,
+                history_config=history_config,
+                use_trader_history=use_trader_history,
             )
-            row = {
-                "campaignId": position["campaignId"],
-                "accountId": position["accountId"],
-                "positionId": position["positionId"],
-                "openDateTime": position["openDateTime"],
-                "closeDateTime": position["closeDateTime"],
-                "campaignDate": position["campaignDate"],
-                "traderKey": position["traderKey"],
-                "ipClusterId": position["ipClusterId"],
-                "exit_type": position["exit_type"],
-                "gross_loss_per_lot": gross_loss_per_lot,
-                "clears_hurdle": gross_loss_per_lot > HURDLE if pd.notna(gross_loss_per_lot) else np.nan,
-            }
-            row.update(features)
-            rows.append(row)
-            state.update(position)
+            state = TraderState(
+                {
+                    "start_balance": start_balance,
+                    "campaign_id": first["campaignId"],
+                    "campaign_date": first["campaignDate"],
+                    "trader_key": first["traderKey"],
+                    "prior_campaigns": history_features["prior_campaigns"],
+                    "shared_ip": bool(first["sharedIpFlag"]) if pd.notna(first["sharedIpFlag"]) else False,
+                    "ip_cluster_size": first["ip_cluster_size"],
+                    "challenge_type": first["challenge_type"],
+                    "gold_vol_prev_day": first["gold_vol_prev_day"],
+                    "breach_threshold_usd": BREACH_THRESHOLD_USD,
+                    "target_threshold_usd": TARGET_THRESHOLD_USD,
+                    "trader_prior_tilt": history_features["trader_prior_tilt"],
+                    "trader_prior_sl_discipline": history_features["trader_prior_sl_discipline"],
+                    "trader_prior_survival": history_features["trader_prior_survival"],
+                    "is_cold_start": history_features["is_cold_start"],
+                }
+            )
+
+            for position in account_group.to_dict("records"):
+                features = state.compute_features(position)
+                gross_loss_per_lot = (
+                    -float(position["profit"]) / float(position["amount"])
+                    if float(position["amount"]) != 0.0
+                    else np.nan
+                )
+                row = {
+                    "campaignId": position["campaignId"],
+                    "accountId": position["accountId"],
+                    "positionId": position["positionId"],
+                    "openDateTime": position["openDateTime"],
+                    "closeDateTime": position["closeDateTime"],
+                    "campaignDate": position["campaignDate"],
+                    "traderKey": position["traderKey"],
+                    "ipClusterId": position["ipClusterId"],
+                    "exit_type": position["exit_type"],
+                    "gross_loss_per_lot": gross_loss_per_lot,
+                    "reverse_profit_per_lot": reverse_profit_per_lot(gross_loss_per_lot)
+                    if pd.notna(gross_loss_per_lot)
+                    else np.nan,
+                    "clears_hurdle": gross_loss_per_lot > HURDLE if pd.notna(gross_loss_per_lot) else np.nan,
+                }
+                row.update(features)
+                rows.append(row)
+                campaign_rows.append(row)
+                state.update(position)
+
+        if use_trader_history and campaign_rows:
+            _update_trader_histories_for_campaign(
+                pd.DataFrame(campaign_rows),
+                trader_histories,
+                history_config,
+            )
 
     return pd.DataFrame(rows)
 
 
+def _history_features_for_campaign(
+    account_row: pd.Series,
+    *,
+    current_campaign_id: int,
+    trader_histories: dict[str, TraderHistory],
+    history_config: Mapping[str, Any],
+    use_trader_history: bool,
+) -> dict[str, Any]:
+    if not use_trader_history:
+        prior_campaigns = int(account_row["prior_campaigns"]) if pd.notna(account_row["prior_campaigns"]) else 0
+        return {
+            "prior_campaigns": prior_campaigns,
+            "trader_prior_tilt": np.nan,
+            "trader_prior_sl_discipline": np.nan,
+            "trader_prior_survival": np.nan,
+            "is_cold_start": prior_campaigns == 0,
+        }
+
+    trader_key = account_row["traderKey"]
+    if pd.isna(trader_key):
+        return TraderHistory(history_config).compute_features(current_campaign_id)
+
+    trader_key = str(trader_key)
+    if trader_key not in trader_histories:
+        trader_histories[trader_key] = TraderHistory(history_config)
+    return trader_histories[trader_key].compute_features(current_campaign_id)
+
+
+def _update_trader_histories_for_campaign(
+    campaign_rows: pd.DataFrame,
+    trader_histories: dict[str, TraderHistory],
+    history_config: Mapping[str, Any],
+) -> None:
+    for trader_key, trader_rows in campaign_rows.groupby("traderKey", dropna=True):
+        trader_rows = trader_rows.sort_values(["openDateTime", "positionId"], kind="mergesort")
+        tilt_rows = trader_rows.loc[trader_rows["loss_streak"] >= 2, "gross_loss_per_lot"]
+        sl_rows = trader_rows["sl_distance_pct"].dropna()
+        survival_span_hours = (
+            trader_rows["closeDateTime"].max() - trader_rows["openDateTime"].min()
+        ).total_seconds() / 3600.0
+        summary = {
+            "tilt_mean": tilt_rows.mean() if not tilt_rows.empty else np.nan,
+            "tilt_n": int(tilt_rows.notna().sum()),
+            "sl_sum": float(sl_rows.sum()) if not sl_rows.empty else np.nan,
+            "sl_n": int(sl_rows.shape[0]),
+            "survival_span_hours": survival_span_hours,
+            "survival_n": int(len(trader_rows)),
+        }
+        trader_key = str(trader_key)
+        if trader_key not in trader_histories:
+            trader_histories[trader_key] = TraderHistory(history_config)
+        trader_histories[trader_key].update_campaign(int(trader_rows["campaignId"].iloc[0]), summary)
+
+
 def print_summary(features_df: pd.DataFrame) -> None:
     print(f"\nrow_count: {len(features_df)}")
-    print("\nNaN rate per feature:")
-    nan_rates = features_df[FEATURE_COLUMNS].isna().mean().sort_values(ascending=False)
-    print(nan_rates.to_string(float_format=lambda value: f"{value:.2%}"))
+    primary = features_df.loc[
+        features_df["campaignId"].between(PRIMARY_CAMPAIGN_MIN, PRIMARY_CAMPAIGN_MAX)
+    ]
+    if "is_cold_start" in primary.columns:
+        print(
+            f"\nPrimary era C{PRIMARY_CAMPAIGN_MIN}-C{PRIMARY_CAMPAIGN_MAX} cold-start rate: "
+            f"{primary['is_cold_start'].mean():.2%}"
+        )
+    else:
+        print(
+            f"\nPrimary era C{PRIMARY_CAMPAIGN_MIN}-C{PRIMARY_CAMPAIGN_MAX} cold-start rate: "
+            "not printed (`is_cold_start` dropped from frozen v2.1 export)"
+        )
+    print(
+        f"\nPrimary era C{PRIMARY_CAMPAIGN_MIN}-C{PRIMARY_CAMPAIGN_MAX} coverage per feature:"
+    )
+    non_nan_rates = primary[FEATURE_COLUMNS].notna().mean().sort_values(ascending=False)
+    print(non_nan_rates.to_string(float_format=lambda value: f"{value:.2%}"))
 
     print("\n5-row feature sample (no identifiers):")
     print(features_df[FEATURE_COLUMNS].head(5).to_string(index=False))
@@ -258,8 +506,20 @@ def main() -> None:
     daily_ohlc = download_xauusd_daily_ohlc(args.cache, min_required_date=min_required_date)
     positions = attach_gold_vol_prev_day(positions, daily_ohlc)
 
-    features_df = build_feature_rows(positions, trader_meta, start_balance=args.balance)
-    ordered_columns = IDENTIFIER_COLUMNS + ["exit_type"] + FEATURE_COLUMNS + TARGET_COLUMNS
+    features_df = build_feature_rows(
+        positions,
+        trader_meta,
+        start_balance=args.balance,
+        trader_history_params={"shrinkage_k": args.trader_history_k},
+    )
+    ordered_columns = (
+        IDENTIFIER_COLUMNS
+        + ["exit_type"]
+        + FEATURE_COLUMNS
+        + COMPANION_BALANCE_COLUMNS
+        + SUPPLEMENTAL_FEATURE_COLUMNS
+        + TARGET_COLUMNS
+    )
     features_df = features_df[ordered_columns]
     features_df.to_csv(args.out, index=False)
 

@@ -1,0 +1,23 @@
+[
+  "num__loss_streak",
+  "num__win_streak",
+  "num__pnl_ewm",
+  "num__lot_zscore",
+  "num__amount",
+  "num__size_after_loss_delta",
+  "num__sl_usage_rate_5",
+  "num__manual_exit_rate_5",
+  "num__pnl_pct",
+  "num__dd_from_peak_pct",
+  "num__trade_index",
+  "num__log_dt_close",
+  "num__trades_per_hour",
+  "num__prior_campaigns_x_loss_streak_ge_2",
+  "num__shared_ip",
+  "num__ip_cluster_size",
+  "num__gold_vol_prev_day",
+  "num__same_direction_reentry",
+  "num__size_delta_ratio",
+  "cat__challenge_type=11",
+  "cat__challenge_type=unknown"
+]

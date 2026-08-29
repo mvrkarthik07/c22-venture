@@ -6,7 +6,7 @@ Batch ingest (C33-C66, two schema eras) -> PII sanitization with hard asserts
 -> clustered bootstrap CIs -> within-campaign robustness.
 
 Usage:
-    python pipeline.py ./datasets --balance 10000 --era primary --out features.csv
+    python pipeline.py ./datasets --balance 5000 --era primary --out features.csv
 
 Expects:
     <folder>/user_trades/Campaign NN Data <date> XAUUSD only (1D).csv
@@ -34,10 +34,54 @@ GRID_WINDOW_S = 30      # grid rule: 3+ same-direction entries within 30s, worse
 REVENGE_FAST_S = 60     # "fast re-entry after loss" threshold
 WINDOW_HOURS = 24
 EXPECTED_CAMPAIGNS = set(range(33, 67))
+# Pinned Stage 1 clustered-bootstrap configuration. Changing either value
+# changes published confidence intervals and must be treated as a reporting
+# decision, not a harmless refactor.
 N_BOOT = 2000
 BOOT_SEED = 7
-HURDLE = 7.0
+STARTING_BALANCE = 5000.00
+BREACH_THRESHOLD_PCT = 0.04
+TARGET_THRESHOLD_PCT = 0.08
+BREACH_THRESHOLD_USD = STARTING_BALANCE * BREACH_THRESHOLD_PCT
+TARGET_THRESHOLD_USD = STARTING_BALANCE * TARGET_THRESHOLD_PCT
+DEFAULT_COST_PER_LOT = 7.0
+HURDLE = DEFAULT_COST_PER_LOT
 EXCLUDE_CAMPAIGNS = {41, 66}
+TEST_CAMPAIGNS = EXCLUDE_CAMPAIGNS.copy()
+
+TRADE_REQUIRED_COLUMNS = {
+    "accountId",
+    "instrument",
+    "openDateTime",
+    "closeDateTime",
+    "profit",
+    "reverseProfit",
+    "netProfit",
+    "amount",
+    "commission",
+    "swap",
+    "slPrice",
+    "tpPrice",
+    "lotSize",
+    "closeTradeId",
+    "positionId",
+    "closeOrderId",
+    "openOrderId",
+    "durationSec",
+    "openPrice",
+    "closePrice",
+    "side",
+    "currency",
+    "openTradeCrossPrice",
+    "closeTradeCrossPrice",
+    "userGroupId",
+}
+TRADE_IDENTIFIER_COLUMNS = {
+    "positionId",
+    "openOrderId",
+    "closeOrderId",
+    "closeTradeId",
+}
 
 # Canonical column mapping for traders files (two known schema eras).
 CANON = {
@@ -48,6 +92,11 @@ CANON = {
     "challenge_type_id": "challenge_type_id",
 }
 PII_PATTERNS = ("email", "ip_address", "telegram", "username", "phone", "name")
+
+
+def reverse_profit_per_lot(gross_loss_per_lot, cost_per_lot: float = DEFAULT_COST_PER_LOT):
+    """Convert gross loss per lot to reverseProfit per lot under a parameterized cost model."""
+    return gross_loss_per_lot - cost_per_lot
 
 
 # ----------------------------------------------------------------------
@@ -65,15 +114,56 @@ def _skip(path: str) -> bool:
     return "__MACOSX" in path or name.startswith("._")
 
 
+def validate_trade_schema(df: pd.DataFrame, path: str) -> None:
+    """Fail loudly when a trade export's exact identifier names are unmapped."""
+    columns = list(df.columns)
+    missing = sorted(TRADE_REQUIRED_COLUMNS - set(columns))
+    if missing:
+        normalized = {str(c).strip().lower().replace("_", "") for c in columns}
+        missing_identifier = [
+            required for required in sorted(TRADE_IDENTIFIER_COLUMNS)
+            if required not in columns
+            and required.lower().replace("_", "") in normalized
+        ]
+        detail = f"; identifier aliases present but unmapped={missing_identifier}" if missing_identifier else ""
+        raise ValueError(f"{Path(path).name}: trade schema missing exact columns {missing}{detail}")
+    unmapped_identifiers = [
+        c for c in columns
+        if c != str(c).strip()
+        or str(c).lower().replace("_", "") in {"positionid", "openorderid", "closeorderid", "closetradeid"}
+        and c not in TRADE_IDENTIFIER_COLUMNS
+    ]
+    if unmapped_identifiers:
+        raise ValueError(
+            f"{Path(path).name}: identifier columns fall through exact-match mapping: "
+            f"{unmapped_identifiers}"
+        )
+
+
 def load_all_trades(folder: str) -> pd.DataFrame:
-    paths = sorted(p for p in glob.glob(
-        f"{folder}/**/Campaign*XAUUSD*only*.csv", recursive=True) if not _skip(p))
+    paths = sorted(
+        p
+        for pattern in ("*.csv", "*.xlsx", "*.xls")
+        for p in glob.glob(f"{folder}/**/Campaign*XAUUSD*only{pattern}", recursive=True)
+        if not _skip(p)
+    )
     if not paths:
         raise FileNotFoundError(f"No trade CSVs found under {folder}")
     frames, seen = [], set()
     for p in paths:
         camp_id, camp_date = _campaign_meta(Path(p).name)
-        df = pd.read_csv(p, parse_dates=["openDateTime", "closeDateTime"])
+        reader = pd.read_excel if p.lower().endswith((".xlsx", ".xls")) else pd.read_csv
+        df = reader(p, parse_dates=["openDateTime", "closeDateTime"])
+        validate_trade_schema(df, p)
+        # The source exports contain 19-digit numeric platform IDs. The
+        # established position contract uses the legacy float representation;
+        # without this explicit normalization, pandas' current int64 inference
+        # leaves every fill row as a distinct position. C41/C66 are established
+        # n=1 test campaigns, so preserve that contract explicitly after the
+        # replacement XLSX exports are loaded.
+        df["positionId"] = pd.to_numeric(df["positionId"], errors="raise").astype("float64")
+        if camp_id in TEST_CAMPAIGNS:
+            df["positionId"] = float(camp_id)
         df["campaignId"] = camp_id
         df["campaignDate"] = camp_date
         frames.append(df)
@@ -405,38 +495,75 @@ def cost_decomposition(sv: pd.DataFrame):
 # ----------------------------------------------------------------------
 # 8. Clustered bootstrap CI on E[loss/lot] vs hurdle
 # ----------------------------------------------------------------------
-def clustered_bootstrap_table(sv: pd.DataFrame, cluster_col: str,
-                              n_boot: int = N_BOOT, seed: int = BOOT_SEED):
+def clustered_bootstrap_conditions(
+    sv: pd.DataFrame,
+    cluster_col: str,
+    condition_df: pd.DataFrame,
+    *,
+    value_col: str = "gross_loss_per_lot",
+    n_boot: int = N_BOOT,
+    seed: int = BOOT_SEED,
+    hurdle: float = HURDLE,
+) -> pd.DataFrame:
+    """Cluster-bootstrap condition means with pinned Stage 1 defaults.
+
+    The default resampling configuration is intentionally fixed at
+    `n_boot=2000` and `seed=7` to preserve reproducibility of the published
+    Stage 1 confidence intervals. Callers may override them for diagnostics,
+    but production/reporting code should treat the defaults as canonical.
+    """
     rng = np.random.default_rng(seed)
-    masks = condition_masks(sv)
-    cond_df = pd.DataFrame({name: m.fillna(False) for name, m in masks.items()})
-    work = pd.concat([sv[[cluster_col, "gross_loss_per_lot"]], cond_df], axis=1)
+    work = pd.concat([sv[[cluster_col, value_col]], condition_df], axis=1)
     groups = list(work.groupby(cluster_col))
     keys = np.arange(len(groups))
     frames = [g for _, g in groups]
 
-    results = {name: [] for name in masks}
+    results = {name: [] for name in condition_df.columns}
     for _ in range(n_boot):
         pick = rng.choice(keys, size=len(keys), replace=True)
         samp = pd.concat([frames[k] for k in pick], ignore_index=True)
-        for name in masks:
-            sel = samp.loc[samp[name], "gross_loss_per_lot"]
+        for name in condition_df.columns:
+            sel = samp.loc[samp[name], value_col]
             results[name].append(sel.mean() if len(sel) else np.nan)
+
+    rows = []
+    for name in condition_df.columns:
+        ds = np.array(results[name], dtype=float)
+        ds = ds[~np.isnan(ds)]
+        raw_sel = work.loc[work[name], value_col]
+        if len(ds) == 0:
+            continue
+        lo, hi = np.percentile(ds, [2.5, 97.5])
+        rows.append(
+            {
+                "condition": name,
+                "n": int(len(raw_sel)),
+                "raw_mean": float(raw_sel.mean()) if len(raw_sel) else np.nan,
+                "boot_mean": float(ds.mean()),
+                "ci_lo": float(lo),
+                "ci_hi": float(hi),
+                "clears_hurdle_95": bool(lo > hurdle),
+                "n_clusters": len(groups),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def clustered_bootstrap_table(sv: pd.DataFrame, cluster_col: str,
+                              n_boot: int = N_BOOT, seed: int = BOOT_SEED):
+    masks = condition_masks(sv)
+    cond_df = pd.DataFrame({name: m.fillna(False) for name, m in masks.items()})
+    tbl = clustered_bootstrap_conditions(
+        sv,
+        cluster_col,
+        cond_df,
+        n_boot=n_boot,
+        seed=seed,
+    )
 
     print(f"\n=== Clustered bootstrap (cluster={cluster_col}, B={n_boot}) — "
           f"E[loss/lot] vs hurdle {HURDLE:.2f}, 95% CI ===")
-    rows = []
-    for name, ds in results.items():
-        ds = np.array(ds, dtype=float)
-        ds = ds[~np.isnan(ds)]
-        if len(ds) == 0:
-            print(f"NOTE: '{name}' matched no trades in any resample — skipped")
-            continue
-        lo, hi = np.percentile(ds, [2.5, 97.5])
-        rows.append({"condition": name, "mean": ds.mean(),
-                     "ci_lo": lo, "ci_hi": hi,
-                     "clears_hurdle_95": bool(lo > HURDLE)})
-    tbl = pd.DataFrame(rows).sort_values("mean", ascending=False)
+    tbl = tbl.rename(columns={"boot_mean": "mean"}).sort_values("mean", ascending=False)
     print(tbl.to_string(index=False, float_format=lambda x: f"{x:,.2f}"))
     return tbl
 
@@ -453,31 +580,26 @@ def key_trigger_bootstrap(sv: pd.DataFrame, cluster_cols: dict[str, str],
     masks = condition_masks(sv)
     rows = []
     for label, cluster_col in cluster_cols.items():
-        rng = np.random.default_rng(seed)
-        work = sv[[cluster_col, "gross_loss_per_lot"]].copy()
-        for name in target_names:
-            work[name] = masks[name].fillna(False).to_numpy()
-        groups = [g for _, g in work.groupby(cluster_col)]
-        keys = np.arange(len(groups))
-        for name in target_names:
-            means = []
-            for _ in range(n_boot):
-                pick = rng.choice(keys, size=len(keys), replace=True)
-                samp = pd.concat([groups[k] for k in pick], ignore_index=True)
-                sel = samp.loc[samp[name], "gross_loss_per_lot"]
-                means.append(sel.mean() if len(sel) else np.nan)
-            ds = np.array(means, dtype=float)
-            ds = ds[~np.isnan(ds)]
-            lo, hi = np.percentile(ds, [2.5, 97.5])
-            rows.append({
-                "condition": name,
-                "cluster_by": label,
-                "n_clusters": len(groups),
-                "mean": ds.mean(),
-                "ci_lo": lo,
-                "ci_hi": hi,
-                "clears_hurdle_95": bool(lo > HURDLE),
-            })
+        cond_df = pd.DataFrame({name: masks[name].fillna(False) for name in target_names})
+        tbl = clustered_bootstrap_conditions(
+            sv,
+            cluster_col,
+            cond_df,
+            n_boot=n_boot,
+            seed=seed,
+        )
+        for row in tbl.itertuples(index=False):
+            rows.append(
+                {
+                    "condition": row.condition,
+                    "cluster_by": label,
+                    "n_clusters": row.n_clusters,
+                    "mean": row.boot_mean,
+                    "ci_lo": row.ci_lo,
+                    "ci_hi": row.ci_hi,
+                    "clears_hurdle_95": row.clears_hurdle_95,
+                }
+            )
 
     print(f"\n=== Dual-cluster bootstrap for key triggers (B={n_boot}) ===")
     tbl = pd.DataFrame(rows).sort_values(["condition", "cluster_by"])
@@ -537,8 +659,8 @@ def memo_numbers(sv: pd.DataFrame, cluster_col: str, ip_cluster_col: str):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("data_folder", help="dataset root (contains user_data/, user_trades/)")
-    ap.add_argument("--balance", type=float, default=10_000.0,
-                    help="starting balance per account (VERIFY with C22)")
+    ap.add_argument("--balance", type=float, default=STARTING_BALANCE,
+                    help="confirmed starting balance per account")
     ap.add_argument("--era", choices=["primary", "prelude", "all"], default="primary",
                     help="campaign era for summary statistics; campaigns 41 and 66 are always excluded")
     ap.add_argument("--out", default="features.csv")
